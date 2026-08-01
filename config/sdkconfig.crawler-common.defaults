@@ -1,0 +1,30 @@
+# ESP32-S3 N16R8 memory interface used by the Crawler board.
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_BOOT_INIT=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Keep all driver and TCP/IP work off the policy core.
+CONFIG_ESP32_WIFI_TASK_PINNED_TO_CORE_0=y
+CONFIG_LWIP_TCPIP_TASK_AFFINITY_CPU0=y
+CONFIG_AUTOSTART_ARDUINO=y
+CONFIG_ARDUINO_RUN_CORE1=y
+CONFIG_ARDUINO_EVENT_RUN_CORE0=y
+
+# The generated FP32 policy is compiled for the maximum S3 CPU frequency.
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Preserve the existing BLE controller/host support used by NimBLE-Arduino.
+CONFIG_BT_ENABLED=y
+
+# Arduino's timing APIs and delay implementation require a 1 kHz RTOS tick.
+CONFIG_FREERTOS_HZ=1000
+
+# Keep the current global socket capacity. HTTPD is limited to five client
+# sockets in code, leaving two of these ten sockets outside HTTPD.
+CONFIG_LWIP_MAX_SOCKETS=10

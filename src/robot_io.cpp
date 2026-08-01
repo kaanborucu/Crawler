@@ -37,7 +37,14 @@ RobotIO::RobotIO()
       estimatorInitialized_(false),
       previousSampleMs_(0),
       previousPositionRad_{},
-      latestMockTargetsRad_{} {}
+      latestMockTargetsRad_{},
+      latestHardwareState_{},
+      motionGate_(false),
+      fastSafetyGate_(false)
+#if defined(ARDUINO)
+      , mutex_(portMUX_INITIALIZER_UNLOCKED), taskHandle_(nullptr)
+#endif
+{}
 
 uint32_t RobotIO::nowMs() const { return monotonicMs(); }
 
@@ -47,12 +54,20 @@ bool RobotIO::begin() {
   servosDisabled_ = true;
   estimatorInitialized_ = false;
   previousSampleMs_ = 0;
+  latestHardwareState_ = {};
+  motionGate_ = false;
+  fastSafetyGate_ = false;
 #if !CRAWLER_USE_MOCK_HARDWARE && defined(ARDUINO)
   if (calibrationValid()) {
     for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
       if (ledcSetup(i, 50, 16) == 0) return false;
       ledcAttachPin(static_cast<uint8_t>(crawler::config::servo::calibrations[i].pwmPin), i);
     }
+    if (xTaskCreatePinnedToCore(taskEntry, "crawler_joints", 4096, this, 9,
+                                &taskHandle_, 0) != pdPASS) {
+      return false;
+    }
+    delay(20);
   }
 #endif
   disableServos();
@@ -150,7 +165,7 @@ void RobotIO::updateEstimatedVelocity(const float position[3],
   previousSampleMs_ = timestampMs;
 }
 
-crawler::JointState RobotIO::readJointState() {
+crawler::JointState RobotIO::sampleJointState() {
   crawler::JointState state = {};
   state.timestampMs = nowMs();
 #if CRAWLER_USE_MOCK_HARDWARE
@@ -185,8 +200,26 @@ crawler::JointState RobotIO::readJointState() {
   return state;
 }
 
+crawler::JointState RobotIO::readJointState() {
+#if CRAWLER_USE_MOCK_HARDWARE
+  return sampleJointState();
+#elif defined(ARDUINO)
+  crawler::JointState state = {};
+  portENTER_CRITICAL(&mutex_);
+  state = latestHardwareState_;
+  portEXIT_CRITICAL(&mutex_);
+  return state;
+#else
+  return {};
+#endif
+}
+
 void RobotIO::writeTargets(const float targetRad[3]) {
   if (targetRad == nullptr) return;
+  if (!motionGate_ || !fastSafetyGate_) {
+    disableServos();
+    return;
+  }
   for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
     if (!std::isfinite(targetRad[i])) {
       disableServos();
@@ -220,6 +253,23 @@ void RobotIO::writeTargets(const float targetRad[3]) {
 #endif
 }
 
+void RobotIO::holdCurrentPosition(const crawler::JointState& joints) {
+  if (!joints.valid) {
+    disableServos();
+    return;
+  }
+  float holdTargetsRad[crawler::kJointCount] = {};
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    if (!std::isfinite(joints.positionRad[i])) {
+      disableServos();
+      return;
+    }
+    holdTargetsRad[i] =
+        joints.positionRad[i] - crawler::config::servo::calibrations[i].defaultPositionRad;
+  }
+  writeTargets(holdTargetsRad);
+}
+
 void RobotIO::disableServos() {
   servosDisabled_ = true;
 #if !CRAWLER_USE_MOCK_HARDWARE && defined(ARDUINO)
@@ -239,6 +289,32 @@ bool RobotIO::usingMockHardware() const {
 #endif
 }
 
+bool RobotIO::servosEnabled() const { return !servosDisabled_; }
+
 uint32_t RobotIO::mockWriteCount() const { return mockWrites_; }
 
 const float* RobotIO::latestMockTargets() const { return latestMockTargetsRad_; }
+
+void RobotIO::setMotionGate(bool allowed) { motionGate_ = allowed; }
+
+void RobotIO::setFastSafetyGate(bool allowed) { fastSafetyGate_ = allowed; }
+
+#if defined(ARDUINO)
+void RobotIO::taskEntry(void* argument) {
+  static_cast<RobotIO*>(argument)->taskLoop();
+}
+
+void RobotIO::taskLoop() {
+  TickType_t lastWake = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(2);
+  for (;;) {
+    const crawler::JointState sample = sampleJointState();
+    if (sample.valid) {
+      portENTER_CRITICAL(&mutex_);
+      latestHardwareState_ = sample;
+      portEXIT_CRITICAL(&mutex_);
+    }
+    vTaskDelayUntil(&lastWake, period == 0 ? 1 : period);
+  }
+}
+#endif

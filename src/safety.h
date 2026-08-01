@@ -10,6 +10,7 @@ class Safety {
   void begin();
   crawler::SafetyDecision evaluate(const crawler::VelocityCommand& command,
                                    const crawler::JointState& joints,
+                                   const crawler::ImuState& imu,
                                    bool bleConnected,
                                    bool calibrationValid);
   void raiseFault(crawler::FaultCode fault);

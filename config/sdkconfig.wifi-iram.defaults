@@ -1,0 +1,3 @@
+# Move the connected Wi-Fi driver's hot and receive paths out of flash.
+CONFIG_ESP32_WIFI_IRAM_OPT=y
+CONFIG_ESP32_WIFI_RX_IRAM_OPT=y

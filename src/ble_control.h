@@ -19,6 +19,17 @@ struct BleCommandPacketV1 {
   uint16_t sequence;
 };
 
+// Version 2 adds a control mode and three raw joint-position offsets in
+// milliradians. The packet remains integer-only for deterministic BLE size.
+struct BleCommandPacketV2 {
+  uint8_t version;
+  uint8_t flags;
+  int16_t forwardMillimetersPerSecond;
+  int16_t lateralMillimetersPerSecond;
+  int16_t rawPositionMilliradians[crawler::kJointCount];
+  uint16_t sequence;
+};
+
 struct BleStatusPacketV1 {
   uint8_t protocolVersion;
   uint8_t robotState;
@@ -32,6 +43,17 @@ struct BleStatusPacketV1 {
 
 static_assert(sizeof(BleCommandPacketV1) == 8,
               "BLE command packet must remain 8 bytes");
+static_assert(sizeof(BleCommandPacketV2) == 14,
+              "BLE command packet v2 must remain 14 bytes");
+
+namespace ble_flags {
+constexpr uint8_t enable = 0x01;
+constexpr uint8_t emergencyStop = 0x02;
+constexpr uint8_t clearFault = 0x04;
+constexpr uint8_t rawPositionMode = 0x08;
+constexpr uint8_t scriptedSweepMode = 0x10;
+constexpr uint8_t modeMask = rawPositionMode | scriptedSweepMode;
+}
 
 class BleControl {
  public:
@@ -58,5 +80,9 @@ class BleControl {
 };
 
 bool decodeBleCommandPacketV1(const uint8_t* data, size_t length,
+                              uint32_t receivedAtMs,
+                              crawler::VelocityCommand& command);
+
+bool decodeBleCommandPacketV2(const uint8_t* data, size_t length,
                               uint32_t receivedAtMs,
                               crawler::VelocityCommand& command);

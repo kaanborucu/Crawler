@@ -1,0 +1,4 @@
+# Control profile: leave Wi-Fi hot paths in flash so cache geometry can be
+# measured independently from the Wi-Fi IRAM optimization.
+# CONFIG_ESP32_WIFI_IRAM_OPT is not set
+# CONFIG_ESP32_WIFI_RX_IRAM_OPT is not set

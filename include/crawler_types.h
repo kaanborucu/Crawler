@@ -14,6 +14,12 @@ enum class RobotState : uint8_t {
   EmergencyStopped = 4,
 };
 
+enum class ControlMode : uint8_t {
+  Policy = 0,
+  RawPosition = 1,
+  ScriptedSweep = 2,
+};
+
 enum class FaultCode : uint8_t {
   None = 0,
   InvalidCalibration = 1,
@@ -36,9 +42,18 @@ struct JointState {
   uint32_t timestampMs;
 };
 
+struct ImuState {
+  float linearAccelerationMps2[3];
+  float angularVelocityRadPerSecond[3];
+  bool valid;
+  uint32_t timestampMs;
+};
+
 struct VelocityCommand {
   float forwardMetersPerSecond;
   float lateralMetersPerSecond;
+  float rawPositionRad[kJointCount];
+  ControlMode mode;
   bool enableRequested;
   bool emergencyStop;
   bool clearFaultRequested;

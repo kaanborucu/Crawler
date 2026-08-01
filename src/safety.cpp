@@ -34,9 +34,27 @@ bool finiteJointData(const crawler::JointState& joints) {
 }
 
 bool finiteCommandData(const crawler::VelocityCommand& command) {
-  return !command.valid ||
-         (std::isfinite(command.forwardMetersPerSecond) &&
-          std::isfinite(command.lateralMetersPerSecond));
+  if (!command.valid) return true;
+  if (!std::isfinite(command.forwardMetersPerSecond) ||
+      !std::isfinite(command.lateralMetersPerSecond) ||
+      command.mode > crawler::ControlMode::ScriptedSweep) {
+    return false;
+  }
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    if (!std::isfinite(command.rawPositionRad[i])) return false;
+  }
+  return true;
+}
+
+bool finiteImuData(const crawler::ImuState& imu) {
+  if (!imu.valid) return false;
+  for (uint8_t i = 0; i < 3; ++i) {
+    if (!std::isfinite(imu.linearAccelerationMps2[i]) ||
+        !std::isfinite(imu.angularVelocityRadPerSecond[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool jointsWithinConfiguredLimits(const crawler::JointState& joints) {
@@ -97,14 +115,16 @@ bool Safety::jointsNearDefault(const crawler::JointState& joints) const {
 
 crawler::SafetyDecision Safety::evaluate(
     const crawler::VelocityCommand& command,
-    const crawler::JointState& joints, bool bleConnected,
-    bool calibrationValid) {
+    const crawler::JointState& joints, const crawler::ImuState& imu,
+    bool bleConnected, bool calibrationValid) {
   if (command.emergencyStop) setFault(crawler::FaultCode::EmergencyStopRequested);
 
   const bool causeGone =
       !command.emergencyStop && calibrationValid && finiteJointData(joints) &&
+      finiteImuData(imu) &&
       bleConnected && command.valid && finiteCommandData(command) &&
       nowMs() - joints.timestampMs <= crawler::config::safety::sensorTimeoutMs &&
+      nowMs() - imu.timestampMs <= crawler::config::safety::sensorTimeoutMs &&
       nowMs() - command.receivedAtMs <= crawler::config::safety::commandTimeoutMs;
 
   if (faultActive()) {
@@ -125,9 +145,16 @@ crawler::SafetyDecision Safety::evaluate(
     setFault(crawler::FaultCode::SensorInvalid);
   } else if (!finiteJointData(joints)) {
     setFault(crawler::FaultCode::NonFiniteObservation);
+  } else if (!imu.valid) {
+    setFault(crawler::FaultCode::SensorInvalid);
+  } else if (!finiteImuData(imu)) {
+    setFault(crawler::FaultCode::NonFiniteObservation);
   } else if (!jointsWithinConfiguredLimits(joints)) {
     setFault(crawler::FaultCode::JointLimitViolation);
   } else if (nowMs() - joints.timestampMs >
+             crawler::config::safety::sensorTimeoutMs) {
+    setFault(crawler::FaultCode::SensorTimeout);
+  } else if (nowMs() - imu.timestampMs >
              crawler::config::safety::sensorTimeoutMs) {
     setFault(crawler::FaultCode::SensorTimeout);
   } else if (!bleConnected) {

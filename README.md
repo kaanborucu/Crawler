@@ -17,25 +17,29 @@ ESP32 board.
 ## Student-policy specification
 
 The generated policy is kept unchanged in `src/student_policy.c`, declared by
-`include/student_policy.h`, and accepts `[1,55]` FP32 observations while
+`include/student_policy.h`, and accepts `[1,85]` FP32 observations while
 returning `[1,3]` FP32 actions. The generated model owns its observation
 normalization. The application performs only the documented preprocessing,
 action clamp, target scale, and trained target filter around that model.
 
 ## Simplified architecture
 
-The runtime has six concrete pieces:
+The runtime has eight concrete pieces:
 
 - `Crawler`: startup, absolute 50 Hz scheduling, safety coordination, and
   reduced-rate telemetry.
 - `PolicyPipeline`: preprocessing, five-frame histories, observation flattening,
   generated-policy inference, finite checks, scaling, and filtering.
 - `RobotIO`: compile-time-selected deterministic mock I/O or ADC/LEDC hardware
-  I/O, including calibration mappings.
+  I/O, including a 500 Hz hardware feedback task and calibration mappings.
+- `ImuSensor`: MPU6050 FIFO acquisition at the configured 1 kHz sensor rate;
+  the policy consumes a coherent latest snapshot at 50 Hz.
 - `BleControl`: packed command parsing, sequence/timestamp handling, BLE
   service callbacks, connection state, and status notifications.
 - `Safety`: readiness checks, arming, timeouts, E-stop, latched faults, and
   explicit recovery.
+- `WifiTelemetry`: optional read-only SoftAP dashboard on a separate
+  low-priority network task; it cannot send robot commands.
 - `crawler_config.h` and `crawler_types.h`: shared constants and state types.
 
 No generic hardware interfaces or per-transformation classes remain.
@@ -43,30 +47,33 @@ No generic hardware interfaces or per-transformation classes remain.
 ## Folder structure
 
 ```text
-include/  crawler_config.h  crawler_types.h  student_policy.h
+include/  crawler_config.h  crawler_types.h  imu_sensor.h  student_policy.h
+          wifi_config.h
 src/      main.cpp, Crawler, BleControl, RobotIO, PolicyPipeline, Safety,
-          student_policy.c
+          ImuSensor, WifiTelemetry, student_policy.c
+web/      index.html  app.js  style.css
 test/     test_pipeline.cpp  test_safety.cpp  test_servo_mapping.cpp
-models/   model_1100.onnx
+models/   acc_studentV1.onnx  acc_studentV1.json
 tools/    check_onnx.py  ble_controller.py
 ```
 
 ## Build environments
 
-- `esp32-s3-mock`: default; deterministic mock joints and actuator storage,
-  with no ADC or PWM hardware access.
-- `esp32-s3-hardware`: real ADC feedback and LEDC output code; invalid
-  calibration prevents startup/arming and keeps outputs disabled.
+- `esp32-s3-mock-wifi-idf-httpd-iram-cache32`: default; deterministic mock
+  hardware with the read-only SoftAP dashboard and inference-deadline fault
+  enforcement disabled for performance testing.
+- `esp32-s3-hardware-wifi-idf-httpd-iram-cache32`: real sensors and actuators
+  with the same dashboard configuration and inference-deadline enforcement
+  enabled.
 - `native-tests`: Windows-host tests without Arduino, ESP32, BLE, GPIO, ADC, or
   PWM dependencies.
 
 Build and run all checks:
 
 ```powershell
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e native-tests
-& '.pio\build\native-tests\program.exe'
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-mock
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-hardware
+& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' test -e native-tests
+& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-mock-wifi-idf-httpd-iram-cache32
+& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-hardware-wifi-idf-httpd-iram-cache32
 & '.\.venv-onnx\Scripts\python.exe' tools\check_onnx.py
 ```
 
@@ -110,23 +117,71 @@ python tools\ble_controller.py --name Crawler-S3 --stop
 
 ## Observation layout and action processing
 
-The policy observation is `[1,55]`, flattened oldest to newest with joint order
+The policy observation is `[1,85]`, flattened oldest to newest with joint order
 1, 2, 3:
 
 ```text
 obs[0:15]   position history, five frames × three joints
 obs[15:30]  velocity history, five frames × three joints
-obs[30:45]  previous clamped-action history, five frames × three joints
-obs[45:55]  command history, five frames × forward/lateral
+obs[30:45]  linear-acceleration history, five frames × three axes
+obs[45:60]  angular-velocity history, five frames × three axes
+obs[60:75]  previous clamped-action history, five frames × three joints
+obs[75:85]  command history, five frames × forward/lateral
 ```
 
 Position is measured radians minus the configured default, clamped to ±1.5707963
-rad. Velocity is clamped to ±20 rad/s and multiplied by 0.1. Commands are
-clamped to ±1.5 m/s. At startup, all five sensor/command frames are filled
+rad. Velocity is clamped to ±20 rad/s and multiplied by 0.1. MPU6050
+acceleration is converted to m/s², clamped to ±50, and multiplied by 0.1;
+gyro is converted to rad/s, clamped to ±20, and multiplied by 0.25. Commands
+are clamped to ±1.5 m/s. At startup, all five sensor/command frames are filled
 from the first valid sample and all action frames are zero. Each cycle builds
 the observation before inserting the newly inferred action. Actions are
 clamped to ±1, scaled by `1.4835298642`, then filtered as
 `0.1 * previous + 0.9 * new`.
+
+## MPU6050 wiring
+
+The hardware firmware uses the MPU6050 over I²C on the existing ESP32 pins:
+
+```text
+MPU6050 VCC  -> ESP32 3V3
+MPU6050 GND  -> ESP32 GND
+MPU6050 SDA  -> ESP32 GPIO 8
+MPU6050 SCL  -> ESP32 GPIO 9
+MPU6050 AD0  -> GND for address 0x68 (or 3V3 for 0x69)
+```
+
+The driver accepts address `0x68` or `0x69`, configures the sensor's internal
+1 kHz sample rate and FIFO, and drains accel+gyro packets from a dedicated
+task. The MPU's DLPF is enabled at approximately 20 Hz; the policy reads the
+newest timestamped snapshot at 50 Hz. It does not remove gravity or apply an
+attitude transform because this exported policy has no orientation input. The
+axis/sign table in `include/crawler_config.h` must match the frame used during
+training before real robot motion is attempted.
+
+## Wi-Fi telemetry
+
+Both ESP32 environments start a read-only SoftAP using
+`include/wifi_config.h`. The mock profile uses simulated joints and IMU data,
+while the hardware profile accesses the connected sensors and actuator
+interfaces:
+
+```text
+SSID:       Crawler-Robot
+Password:   crawler123 (development value)
+Dashboard:  http://192.168.4.1
+WebSocket:  ws://192.168.4.1/ws
+```
+
+In FAULT or DISARMED states, the network task services HTTP/WebSocket traffic
+every 10 ms and sends the newest fixed-size JSON telemetry frame every 250 ms.
+During active policy control, it waits for a post-inference notification,
+performs one HTTP/WebSocket service pass, and sends at most one telemetry frame
+in that window. Incoming WebSocket application messages are ignored. Wi-Fi
+startup or failure does not enable,
+disable, or otherwise control the robot. The dashboard reports radians,
+rad/s, m/s², and rad/s; SoftAP client RSSI is reported as JSON `null` because
+it is not exposed by the selected simple Arduino API.
 
 ## Servo calibration
 

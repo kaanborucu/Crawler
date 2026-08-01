@@ -8,6 +8,7 @@ Crawler crawlerApp;
 
 void setup() {
   Serial.begin(115200);
+  Serial0.begin(115200);
   delay(250);
   crawlerApp.begin();
 }

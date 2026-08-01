@@ -1,4 +1,5 @@
 .pio
+/sdkconfig.esp32-s3-*-idf-*
 .venv-onnx
 __pycache__
 *.pyc

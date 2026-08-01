@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Crawler telemetry</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">ESP32-S3 CRAWLER</p>
+        <h1>Telemetry dashboard</h1>
+      </div>
+      <div id="connection-badge" class="badge warn">DISCONNECTED</div>
+    </header>
+
+    <section class="grid connection-grid">
+      <article class="card"><span>WebSocket</span><strong id="ws-state">Disconnected</strong></article>
+      <article class="card"><span>Uptime</span><strong id="uptime">--</strong></article>
+      <article class="card"><span>Packet age</span><strong id="packet-age">--</strong></article>
+      <article class="card"><span>Received rate</span><strong id="rx-rate">--</strong></article>
+      <article class="card"><span>Free heap</span><strong id="heap">--</strong></article>
+      <article class="card"><span>Minimum heap</span><strong id="heap-min">--</strong></article>
+      <article class="card"><span>SoftAP RSSI</span><strong id="rssi">Unavailable</strong></article>
+    </section>
+
+    <section class="card state-card">
+      <div class="section-title"><h2>Robot state</h2><span id="servo-state" class="pill warn">SERVOS OFF</span></div>
+      <div class="state-values">
+        <div><span>State</span><strong id="robot-state">--</strong></div>
+        <div><span>Fault</span><strong id="fault">--</strong></div>
+        <div><span>BLE command age</span><strong id="command-age">--</strong></div>
+        <div><span>Telemetry drops</span><strong id="telemetry-drops">--</strong></div>
+        <div><span>WebSocket failures</span><strong id="ws-failures">--</strong></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-title"><h2>Joints</h2><span class="unit">radians / rad/s</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Joint</th><th>Position</th><th>Velocity</th><th>Target</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><th>1</th><td id="q0">--</td><td id="qd0">--</td><td id="target0">--</td><td id="action0">--</td></tr>
+            <tr><th>2</th><td id="q1">--</td><td id="qd1">--</td><td id="target1">--</td><td id="action1">--</td></tr>
+            <tr><th>3</th><td id="q2">--</td><td id="qd2">--</td><td id="target2">--</td><td id="action2">--</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="grid two-col">
+      <article class="card">
+        <div class="section-title"><h2>IMU</h2><span class="unit">m/s² and rad/s</span></div>
+        <div class="sensor-grid">
+          <div><span>Acceleration X</span><strong id="acc0">--</strong></div>
+          <div><span>Acceleration Y</span><strong id="acc1">--</strong></div>
+          <div><span>Acceleration Z</span><strong id="acc2">--</strong></div>
+          <div><span>Gyro X</span><strong id="gyro0">--</strong></div>
+          <div><span>Gyro Y</span><strong id="gyro1">--</strong></div>
+          <div><span>Gyro Z</span><strong id="gyro2">--</strong></div>
+        </div>
+        <p class="muted">Configured rates: IMU <b id="imu-rate">--</b> Hz, joints <b id="joint-rate">--</b> Hz</p>
+      </article>
+
+      <article class="card">
+        <div class="section-title"><h2>Policy</h2><span class="unit">50 Hz target</span></div>
+        <div class="sensor-grid">
+          <div><span>Policy rate</span><strong id="policy-rate">--</strong></div>
+          <div><span>Inference</span><strong id="inference">--</strong></div>
+          <div><span>Maximum inference</span><strong id="inference-max">--</strong></div>
+          <div><span>Deadline misses</span><strong id="deadline-misses">--</strong></div>
+          <div><span>Command forward</span><strong id="cmd0">--</strong></div>
+          <div><span>Command lateral</span><strong id="cmd1">--</strong></div>
+        </div>
+      </article>
+    </section>
+
+    <section class="grid two-col">
+      <article class="card chart-card"><div class="section-title"><h2>Joint positions and targets</h2></div><canvas id="joint-chart" width="640" height="220"></canvas><div class="legend"><span class="line cyan"></span>position <span class="line orange"></span>target</div></article>
+      <article class="card chart-card"><div class="section-title"><h2>Policy inference time</h2></div><canvas id="inference-chart" width="640" height="220"></canvas><div class="legend"><span class="line purple"></span>microseconds</div></article>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

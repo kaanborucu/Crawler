@@ -1,0 +1,2 @@
+# Native ESP-IDF HTTP server WebSocket support for the isolated HTTPD builds.
+CONFIG_HTTPD_WS_SUPPORT=y

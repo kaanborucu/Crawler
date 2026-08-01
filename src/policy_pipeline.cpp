@@ -42,6 +42,8 @@ bool finiteArray(const float* values, uint8_t count) {
 PolicyPipeline::PolicyPipeline()
     : positionHistory_{},
       velocityHistory_{},
+      linearAccelerationHistory_{},
+      angularVelocityHistory_{},
       actionHistory_{},
       commandHistory_{},
       previousFilteredTargetRad_{},
@@ -85,6 +87,32 @@ bool PolicyPipeline::preprocessJointState(const crawler::JointState& measured,
   return true;
 }
 
+bool PolicyPipeline::preprocessImuState(const crawler::ImuState& measured,
+                                        float linearAcceleration[3],
+                                        float angularVelocity[3]) {
+  if (!measured.valid || linearAcceleration == nullptr ||
+      angularVelocity == nullptr) {
+    return false;
+  }
+  for (uint8_t i = 0; i < 3; ++i) {
+    if (!std::isfinite(measured.linearAccelerationMps2[i]) ||
+        !std::isfinite(measured.angularVelocityRadPerSecond[i])) {
+      return false;
+    }
+    linearAcceleration[i] =
+        clampValue(measured.linearAccelerationMps2[i],
+                   -crawler::config::policy::imuAccelerationClampMps2,
+                   crawler::config::policy::imuAccelerationClampMps2) *
+        crawler::config::policy::imuAccelerationScale;
+    angularVelocity[i] =
+        clampValue(measured.angularVelocityRadPerSecond[i],
+                   -crawler::config::policy::imuAngularVelocityClampRadPerSecond,
+                   crawler::config::policy::imuAngularVelocityClampRadPerSecond) *
+        crawler::config::policy::imuAngularVelocityScale;
+  }
+  return true;
+}
+
 bool PolicyPipeline::preprocessCommand(const crawler::VelocityCommand& command,
                                        float& forward, float& lateral) {
   if (!command.valid || !std::isfinite(command.forwardMetersPerSecond) ||
@@ -106,6 +134,8 @@ void PolicyPipeline::clearHistories() {
     for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
       positionHistory_[frame][i] = 0.0f;
       velocityHistory_[frame][i] = 0.0f;
+      linearAccelerationHistory_[frame][i] = 0.0f;
+      angularVelocityHistory_[frame][i] = 0.0f;
       actionHistory_[frame][i] = 0.0f;
     }
     commandHistory_[frame][0] = 0.0f;
@@ -125,36 +155,43 @@ void PolicyPipeline::reset() {
   failureCode_ = crawler::FaultCode::None;
 }
 
-void PolicyPipeline::fillInitialHistory(const float position[3],
-                                        const float velocity[3], float forward,
-                                        float lateral) {
+void PolicyPipeline::fillInitialHistory(
+    const float position[3], const float velocity[3],
+    const float linearAcceleration[3], const float angularVelocity[3],
+    float forward, float lateral) {
   clearHistories();
   for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
        ++frame) {
     for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
       positionHistory_[frame][i] = position[i];
       velocityHistory_[frame][i] = velocity[i];
+      linearAccelerationHistory_[frame][i] = linearAcceleration[i];
+      angularVelocityHistory_[frame][i] = angularVelocity[i];
     }
     commandHistory_[frame][0] = forward;
     commandHistory_[frame][1] = lateral;
   }
 }
 
-bool PolicyPipeline::initialize(
-    const crawler::JointState& initialJointState,
-    const crawler::VelocityCommand& initialCommand) {
+bool PolicyPipeline::initialize(const crawler::JointState& initialJointState,
+                                const crawler::ImuState& initialImuState,
+                                const crawler::VelocityCommand& initialCommand) {
   if (!begin()) return false;
   float position[3] = {};
   float velocity[3] = {};
+  float linearAcceleration[3] = {};
+  float angularVelocity[3] = {};
   float forward = 0.0f;
   float lateral = 0.0f;
   if (!preprocessJointState(initialJointState, position, velocity) ||
+      !preprocessImuState(initialImuState, linearAcceleration, angularVelocity) ||
       !preprocessCommand(initialCommand, forward, lateral)) {
     initialized_ = false;
     failureCode_ = crawler::FaultCode::NonFiniteObservation;
     return false;
   }
-  fillInitialHistory(position, velocity, forward, lateral);
+  fillInitialHistory(position, velocity, linearAcceleration, angularVelocity,
+                     forward, lateral);
   for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
     previousFilteredTargetRad_[i] = 0.0f;
   }
@@ -186,6 +223,33 @@ void PolicyPipeline::pushVelocity(const float velocity[3]) {
   }
 }
 
+void PolicyPipeline::pushLinearAcceleration(const float linearAcceleration[3]) {
+  for (uint8_t frame = 1; frame < crawler::config::policy::historyFrames;
+       ++frame) {
+    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+      linearAccelerationHistory_[frame - 1][i] =
+          linearAccelerationHistory_[frame][i];
+    }
+  }
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    linearAccelerationHistory_[crawler::config::policy::historyFrames - 1][i] =
+        linearAcceleration[i];
+  }
+}
+
+void PolicyPipeline::pushAngularVelocity(const float angularVelocity[3]) {
+  for (uint8_t frame = 1; frame < crawler::config::policy::historyFrames;
+       ++frame) {
+    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+      angularVelocityHistory_[frame - 1][i] = angularVelocityHistory_[frame][i];
+    }
+  }
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    angularVelocityHistory_[crawler::config::policy::historyFrames - 1][i] =
+        angularVelocity[i];
+  }
+}
+
 void PolicyPipeline::pushCommand(float forward, float lateral) {
   for (uint8_t frame = 1; frame < crawler::config::policy::historyFrames;
        ++frame) {
@@ -210,22 +274,15 @@ void PolicyPipeline::pushAction(const float action[3]) {
 
 void PolicyPipeline::flattenObservation() {
   uint8_t index = 0;
-  for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
-       ++frame) {
-    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
-      observation_[index++] = positionHistory_[frame][i];
-    }
-  }
-  for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
-       ++frame) {
-    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
-      observation_[index++] = velocityHistory_[frame][i];
-    }
-  }
-  for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
-       ++frame) {
-    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
-      observation_[index++] = actionHistory_[frame][i];
+  const float (*terms[])[3] = {positionHistory_, velocityHistory_,
+                               linearAccelerationHistory_,
+                               angularVelocityHistory_, actionHistory_};
+  for (const float (*term)[3] : terms) {
+    for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
+         ++frame) {
+      for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+        observation_[index++] = term[frame][i];
+      }
     }
   }
   for (uint8_t frame = 0; frame < crawler::config::policy::historyFrames;
@@ -236,6 +293,7 @@ void PolicyPipeline::flattenObservation() {
 }
 
 bool PolicyPipeline::step(const crawler::JointState& jointState,
+                          const crawler::ImuState& imuState,
                           const crawler::VelocityCommand& command,
                           crawler::PolicyResult& result) {
   result = {};
@@ -243,9 +301,12 @@ bool PolicyPipeline::step(const crawler::JointState& jointState,
 
   float position[3] = {};
   float velocity[3] = {};
+  float linearAcceleration[3] = {};
+  float angularVelocity[3] = {};
   float forward = 0.0f;
   float lateral = 0.0f;
   if (!preprocessJointState(jointState, position, velocity) ||
+      !preprocessImuState(imuState, linearAcceleration, angularVelocity) ||
       !preprocessCommand(command, forward, lateral)) {
     failureCode_ = crawler::FaultCode::NonFiniteObservation;
     return false;
@@ -253,6 +314,8 @@ bool PolicyPipeline::step(const crawler::JointState& jointState,
 
   pushPosition(position);
   pushVelocity(velocity);
+  pushLinearAcceleration(linearAcceleration);
+  pushAngularVelocity(angularVelocity);
   pushCommand(forward, lateral);
   flattenObservation();
   if (!finiteArray(observation_, crawler::config::policy::observationSize)) {
@@ -276,8 +339,7 @@ bool PolicyPipeline::step(const crawler::JointState& jointState,
       return false;
     }
     result.rawActions[i] = modelOutput_[0][i];
-    result.clampedActions[i] =
-        clampValue(result.rawActions[i], -1.0f, 1.0f);
+    result.clampedActions[i] = clampValue(result.rawActions[i], -1.0f, 1.0f);
   }
   // The current action is available to the next observation only. It must not
   // influence the observation that produced it.

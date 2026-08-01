@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import NoReturn
 
 
-EXPECTED_INPUT_SHAPE = [1, 55]
+EXPECTED_INPUT_SHAPE = [1, 85]
 EXPECTED_OUTPUT_SHAPE = [1, 3]
 
 
@@ -20,7 +20,7 @@ def fail(message: str) -> NoReturn:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parents[1]
-    model_path = project_root / "models" / "model_1100.onnx"
+    model_path = project_root / "models" / "acc_studentV1.onnx"
     reference_path = project_root / "tools" / "onnx_zero_reference.txt"
 
     if not model_path.is_file():

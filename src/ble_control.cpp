@@ -16,8 +16,8 @@
 namespace {
 
 crawler::VelocityCommand zeroCommand() {
-  crawler::VelocityCommand command = {0.0f, 0.0f, false, false, false,
-                                      false, 0, 0};
+  crawler::VelocityCommand command = {};
+  command.mode = crawler::ControlMode::Policy;
   return command;
 }
 
@@ -91,11 +91,59 @@ bool decodeBleCommandPacketV1(const uint8_t* data, size_t length,
                             (static_cast<uint16_t>(data[7]) << 8);
   command.forwardMetersPerSecond = static_cast<float>(forward) * 0.001f;
   command.lateralMetersPerSecond = static_cast<float>(lateral) * 0.001f;
+  command.mode = crawler::ControlMode::Policy;
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    command.rawPositionRad[i] = 0.0f;
+  }
   command.enableRequested = (data[1] & 0x01u) != 0u;
   command.emergencyStop = (data[1] & 0x02u) != 0u;
   command.clearFaultRequested = (data[1] & 0x04u) != 0u;
   command.valid = true;
   command.sequence = sequence;
+  command.receivedAtMs = receivedAtMs;
+  return true;
+}
+
+bool decodeBleCommandPacketV2(const uint8_t* data, size_t length,
+                              uint32_t receivedAtMs,
+                              crawler::VelocityCommand& command) {
+  if (data == nullptr || length != sizeof(BleCommandPacketV2)) return false;
+  if (data[0] != 2u || (data[1] & 0xE0u) != 0u) return false;
+  const uint8_t modeFlags = data[1] & ble_flags::modeMask;
+  if (modeFlags == ble_flags::modeMask) return false;
+
+  const int16_t forward = static_cast<int16_t>(
+      static_cast<uint16_t>(data[2]) | (static_cast<uint16_t>(data[3]) << 8));
+  const int16_t lateral = static_cast<int16_t>(
+      static_cast<uint16_t>(data[4]) | (static_cast<uint16_t>(data[5]) << 8));
+  if (forward < -1500 || forward > 1500 || lateral < -1500 || lateral > 1500) {
+    return false;
+  }
+
+  command.forwardMetersPerSecond = static_cast<float>(forward) * 0.001f;
+  command.lateralMetersPerSecond = static_cast<float>(lateral) * 0.001f;
+  command.mode = modeFlags == ble_flags::rawPositionMode
+                     ? crawler::ControlMode::RawPosition
+                     : modeFlags == ble_flags::scriptedSweepMode
+                           ? crawler::ControlMode::ScriptedSweep
+                           : crawler::ControlMode::Policy;
+  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+    const size_t offset = 6u + i * sizeof(int16_t);
+    const int16_t positionMilliradians = static_cast<int16_t>(
+        static_cast<uint16_t>(data[offset]) |
+        (static_cast<uint16_t>(data[offset + 1u]) << 8));
+    if (positionMilliradians < -1571 || positionMilliradians > 1571) {
+      return false;
+    }
+    command.rawPositionRad[i] =
+        static_cast<float>(positionMilliradians) * 0.001f;
+  }
+  command.enableRequested = (data[1] & ble_flags::enable) != 0u;
+  command.emergencyStop = (data[1] & ble_flags::emergencyStop) != 0u;
+  command.clearFaultRequested = (data[1] & ble_flags::clearFault) != 0u;
+  command.valid = true;
+  command.sequence = static_cast<uint16_t>(data[12]) |
+                     (static_cast<uint16_t>(data[13]) << 8);
   command.receivedAtMs = receivedAtMs;
   return true;
 }
@@ -197,7 +245,12 @@ void BleControl::publishStatus(const crawler::RobotStatus& status) {
 bool BleControl::acceptPacket(const uint8_t* data, size_t length,
                               uint32_t receivedAtMs) {
   crawler::VelocityCommand parsed = zeroCommand();
-  if (!decodeBleCommandPacketV1(data, length, receivedAtMs, parsed)) return false;
+  const bool decoded = data != nullptr && data[0] == 2u
+                          ? decodeBleCommandPacketV2(data, length, receivedAtMs,
+                                                     parsed)
+                          : decodeBleCommandPacketV1(data, length, receivedAtMs,
+                                                     parsed);
+  if (!decoded) return false;
 #if defined(ARDUINO) && CRAWLER_ENABLE_BLE
   portENTER_CRITICAL(&gBleMux);
 #endif
@@ -220,6 +273,10 @@ void BleControl::setConnected(bool connected) {
   portENTER_CRITICAL(&gBleMux);
 #endif
   connected_ = connected;
+  // A new BLE session may restart its packet sequence at 1. Do not reject
+  // that first command because of a sequence from the previous session.
+  hasLatest_ = false;
+  latest_ = zeroCommand();
 #if defined(ARDUINO) && CRAWLER_ENABLE_BLE
   portEXIT_CRITICAL(&gBleMux);
 #endif

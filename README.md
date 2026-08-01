@@ -68,13 +68,144 @@ tools/    check_onnx.py  ble_controller.py
 - `native-tests`: Windows-host tests without Arduino, ESP32, BLE, GPIO, ADC, or
   PWM dependencies.
 
-Build and run all checks:
+## Setup from zero on Ubuntu 22.04
+
+Install Git, Python, virtual-environment support, and the download tools:
+
+```bash
+sudo apt update
+sudo apt install -y git curl python3 python3-venv
+```
+
+Clone the project and install PlatformIO Core with its isolated official
+installer. Do not run the PlatformIO installer with `sudo`:
+
+```bash
+git clone https://github.com/kaanborucu/Crawler.git
+cd Crawler
+curl -fsSL -o get-platformio.py https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py
+python3 get-platformio.py
+rm get-platformio.py
+PIO="$HOME/.platformio/penv/bin/platformio"
+"$PIO" --version
+```
+
+Install PlatformIO's udev rules so the current user can upload to and monitor
+the board, then unplug and reconnect the ESP32-S3:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/platformio/platformio-core/develop/platformio/assets/system/99-platformio-udev.rules \
+  | sudo tee /etc/udev/rules.d/99-platformio-udev.rules >/dev/null
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo usermod -a -G dialout "$USER"
+```
+
+Log out and back in after changing group membership. Then build the default
+mock firmware and, if required, the real-hardware firmware:
+
+```bash
+"$PIO" run
+"$PIO" run -e esp32-s3-hardware-wifi-idf-httpd-iram-cache32
+```
+
+Connect the board, find its serial port, upload the safe mock build, and open
+the monitor:
+
+```bash
+"$PIO" device list
+"$PIO" run -e esp32-s3-mock-wifi-idf-httpd-iram-cache32 -t upload --upload-port /dev/ttyACM0
+"$PIO" device monitor --port /dev/ttyACM0 --baud 115200
+```
+
+Replace `/dev/ttyACM0` with the port reported by `device list`. Upload the
+hardware environment only after completing calibration and physical safety
+checks.
+
+## Setup from zero on Windows
+
+Install these prerequisites:
+
+1. Git for Windows.
+2. A current 64-bit Python 3 release with the Python launcher (`py`).
+3. The USB serial/JTAG driver required by the specific ESP32-S3 board, if
+   Windows does not install it automatically.
+
+Open a new PowerShell window and verify the first two installations:
 
 ```powershell
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' test -e native-tests
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-mock-wifi-idf-httpd-iram-cache32
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' run -e esp32-s3-hardware-wifi-idf-httpd-iram-cache32
-& '.\.venv-onnx\Scripts\python.exe' tools\check_onnx.py
+git --version
+py --version
+```
+
+Clone the project and install PlatformIO Core in its isolated user
+environment:
+
+```powershell
+git clone https://github.com/kaanborucu/Crawler.git
+Set-Location Crawler
+Invoke-WebRequest `
+    https://raw.githubusercontent.com/platformio/platformio-core-installer/master/get-platformio.py `
+    -OutFile get-platformio.py
+py .\get-platformio.py
+Remove-Item .\get-platformio.py
+$pio = "$env:USERPROFILE\.platformio\penv\Scripts\platformio.exe"
+& $pio --version
+```
+
+Using the full executable path through `$pio` avoids the common
+`pio is not recognized` PowerShell error. Build both retained firmware
+profiles:
+
+```powershell
+& $pio run
+& $pio run -e esp32-s3-hardware-wifi-idf-httpd-iram-cache32
+```
+
+Connect the board, identify its COM port, upload the safe mock build, and open
+the monitor:
+
+```powershell
+& $pio device list
+& $pio run -e esp32-s3-mock-wifi-idf-httpd-iram-cache32 -t upload --upload-port COM5
+& $pio device monitor --port COM5 --baud 115200
+```
+
+Replace `COM5` with the detected port. Close any existing serial monitor before
+uploading if Windows reports that the port is busy. Upload the hardware profile
+only after completing calibration and physical safety checks.
+
+## Local verification
+
+Build and run the native checks on Ubuntu:
+
+```bash
+"$PIO" run -e native-tests
+./.pio/build/native-tests/program
+```
+
+On Windows:
+
+```powershell
+& $pio run -e native-tests
+& .\.pio\build\native-tests\program.exe
+```
+
+The optional ONNX reference check needs NumPy and ONNX Runtime. Create a local
+Python environment and run it on Ubuntu:
+
+```bash
+python3 -m venv .venv-onnx
+./.venv-onnx/bin/python -m pip install --upgrade pip numpy onnxruntime
+./.venv-onnx/bin/python tools/check_onnx.py
+```
+
+Or on Windows:
+
+```powershell
+py -m venv .venv-onnx
+& .\.venv-onnx\Scripts\python.exe -m pip install --upgrade pip numpy onnxruntime
+& .\.venv-onnx\Scripts\python.exe tools\check_onnx.py
 ```
 
 ## Serial monitor
@@ -82,8 +213,8 @@ Build and run all checks:
 The firmware uses 115200 baud. In VS Code, run **PlatformIO: Monitor**, or
 use:
 
-```powershell
-& 'C:\Users\KAAN\.platformio\penv\Scripts\platformio.exe' device monitor -b 115200
+```text
+platformio device monitor --baud 115200
 ```
 
 Choose the board's COM port if PlatformIO does not detect it automatically.

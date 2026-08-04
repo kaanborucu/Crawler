@@ -98,6 +98,8 @@ bool decodeBleCommandPacketV1(const uint8_t* data, size_t length,
   command.enableRequested = (data[1] & 0x01u) != 0u;
   command.emergencyStop = (data[1] & 0x02u) != 0u;
   command.clearFaultRequested = (data[1] & 0x04u) != 0u;
+  command.calibrationRequested = false;
+  command.centerPositionRequested = false;
   command.valid = true;
   command.sequence = sequence;
   command.receivedAtMs = receivedAtMs;
@@ -108,7 +110,7 @@ bool decodeBleCommandPacketV2(const uint8_t* data, size_t length,
                               uint32_t receivedAtMs,
                               crawler::VelocityCommand& command) {
   if (data == nullptr || length != sizeof(BleCommandPacketV2)) return false;
-  if (data[0] != 2u || (data[1] & 0xE0u) != 0u) return false;
+  if (data[0] != 2u || (data[1] & 0x80u) != 0u) return false;
   const uint8_t modeFlags = data[1] & ble_flags::modeMask;
   if (modeFlags == ble_flags::modeMask) return false;
 
@@ -141,6 +143,9 @@ bool decodeBleCommandPacketV2(const uint8_t* data, size_t length,
   command.enableRequested = (data[1] & ble_flags::enable) != 0u;
   command.emergencyStop = (data[1] & ble_flags::emergencyStop) != 0u;
   command.clearFaultRequested = (data[1] & ble_flags::clearFault) != 0u;
+  command.calibrationRequested = (data[1] & ble_flags::calibration) != 0u;
+  command.centerPositionRequested =
+      (data[1] & ble_flags::centerPosition) != 0u;
   command.valid = true;
   command.sequence = static_cast<uint16_t>(data[12]) |
                      (static_cast<uint16_t>(data[13]) << 8);

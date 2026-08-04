@@ -57,6 +57,8 @@ struct VelocityCommand {
   bool enableRequested;
   bool emergencyStop;
   bool clearFaultRequested;
+  bool calibrationRequested;
+  bool centerPositionRequested;
   bool valid;
   uint16_t sequence;
   uint32_t receivedAtMs;

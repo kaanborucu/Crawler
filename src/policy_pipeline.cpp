@@ -343,7 +343,6 @@ bool PolicyPipeline::step(const crawler::JointState& jointState,
   }
   // The current action is available to the next observation only. It must not
   // influence the observation that produced it.
-  pushAction(result.clampedActions);
   for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
     result.targetRad[i] = result.clampedActions[i] *
                           crawler::config::policy::actionScaleRad;
@@ -356,11 +355,19 @@ bool PolicyPipeline::step(const crawler::JointState& jointState,
       return false;
     }
   }
+  result.valid = true;
+  return true;
+}
+
+void PolicyPipeline::commitAction(const crawler::PolicyResult& result) {
+  if (!result.valid || !finiteArray(result.clampedActions, crawler::kJointCount) ||
+      !finiteArray(result.filteredTargetRad, crawler::kJointCount)) {
+    return;
+  }
+  pushAction(result.clampedActions);
   for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
     previousFilteredTargetRad_[i] = result.filteredTargetRad[i];
   }
-  result.valid = true;
-  return true;
 }
 
 const float* PolicyPipeline::latestObservation() const { return observation_; }

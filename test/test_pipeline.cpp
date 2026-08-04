@@ -112,6 +112,7 @@ int runPipelineTests() {
   expect(result.valid && result.clampedActions[0] >= -1.0f &&
              result.clampedActions[0] <= 1.0f,
          "action clamp or result validity is incorrect", failures);
+  pipeline.commitAction(result);
 
   crawler::JointState next = current;
   next.positionRad[0] = 0.7f;
@@ -122,6 +123,7 @@ int runPipelineTests() {
   expect(pipeline.step(next, currentImu, command, result),
          "repeated pipeline step failed",
          failures);
+  pipeline.commitAction(result);
   observation = pipeline.latestObservation();
   expect(near(observation[9], 0.4f) && near(observation[10], -0.5f) &&
              near(observation[11], 0.6f) && near(observation[12], 0.7f),
@@ -163,6 +165,7 @@ int runPipelineTests() {
   crawler::PolicyResult zeroResult = {};
   expect(zeroPipeline.step(zeroJoint, zeroImu, zeroCommand, zeroResult),
          "zero policy step failed", failures);
+  zeroPipeline.commitAction(zeroResult);
   expect(near(zeroResult.rawActions[0], -24.5815792f, 1.0e-3f) &&
              near(zeroResult.rawActions[1], -6.9765086f, 1.0e-3f) &&
              near(zeroResult.rawActions[2], 5.8934464f, 1.0e-3f),

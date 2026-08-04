@@ -342,7 +342,23 @@ void WifiTelemetry::sendTelemetry() {
       "\"cmd_mps\":[%.6g,%.6g],"
       "\"inference_us\":%lu,\"inference_max_us\":%lu,"
       "\"deadline_misses\":%lu,\"policy_hz\":%.6g,"
-      "\"imu_configured_hz\":%lu,\"joint_configured_hz\":%lu,"
+      "\"imu_configured_hz\":%lu,"
+      "\"imu_accel_requested_hz\":%.6g,\"imu_accel_measured_hz\":%.6g,"
+      "\"imu_accel_age_us\":%lu,\"imu_accel_valid\":%s,"
+      "\"imu_accel_accuracy\":%u,\"imu_accel_sequence_gaps\":%lu,"
+      "\"imu_accel_timestamp_backsteps\":%lu,"
+      "\"imu_gyro_requested_hz\":%.6g,\"imu_gyro_measured_hz\":%.6g,"
+      "\"imu_gyro_age_us\":%lu,\"imu_gyro_valid\":%s,"
+      "\"imu_gyro_accuracy\":%u,\"imu_gyro_sequence_gaps\":%lu,"
+      "\"imu_gyro_timestamp_backsteps\":%lu,"
+      "\"imu_reset_recovery_active\":%s,\"imu_reset_count\":%lu,"
+      "\"imu_reset_generation\":%lu,"
+      "\"imu_last_drain_us\":%lu,\"imu_max_drain_us\":%lu,"
+      "\"imu_last_events_per_drain\":%lu,\"imu_max_events_per_drain\":%lu,"
+      "\"imu_drain_budget_hits\":%lu,\"imu_event_limit_hits\":%lu,"
+      "\"imu_transaction_failures\":%lu,\"imu_recovery_attempts\":%lu,"
+      "\"imu_recovery_failures\":%lu,\"imu_last_failure_stage\":%u,"
+      "\"joint_configured_hz\":%lu,"
       "\"fault_code\":%u,\"fault_name\":\"%s\","
       "\"state_name\":\"%s\",\"enabled\":%s,"
       "\"command_age_ms\":%lu,\"heap\":%lu,\"heap_min\":%lu,"
@@ -378,6 +394,33 @@ void WifiTelemetry::sendTelemetry() {
       static_cast<unsigned long>(snapshot.policyDeadlineMisses),
       static_cast<double>(snapshot.policyRateHz),
       static_cast<unsigned long>(snapshot.imuConfiguredHz),
+      static_cast<double>(snapshot.imuAccelRequestedHz),
+      static_cast<double>(snapshot.imuAccelMeasuredHz),
+      static_cast<unsigned long>(snapshot.imuAccelAgeUs),
+      snapshot.imuAccelValid ? "true" : "false",
+      static_cast<unsigned>(snapshot.imuAccelAccuracy),
+      static_cast<unsigned long>(snapshot.imuAccelSequenceGaps),
+      static_cast<unsigned long>(snapshot.imuAccelTimestampBacksteps),
+      static_cast<double>(snapshot.imuGyroRequestedHz),
+      static_cast<double>(snapshot.imuGyroMeasuredHz),
+      static_cast<unsigned long>(snapshot.imuGyroAgeUs),
+      snapshot.imuGyroValid ? "true" : "false",
+      static_cast<unsigned>(snapshot.imuGyroAccuracy),
+      static_cast<unsigned long>(snapshot.imuGyroSequenceGaps),
+      static_cast<unsigned long>(snapshot.imuGyroTimestampBacksteps),
+      snapshot.imuResetRecoveryActive ? "true" : "false",
+      static_cast<unsigned long>(snapshot.imuResetCount),
+      static_cast<unsigned long>(snapshot.imuResetGeneration),
+      static_cast<unsigned long>(snapshot.imuLastDrainUs),
+      static_cast<unsigned long>(snapshot.imuMaxDrainUs),
+      static_cast<unsigned long>(snapshot.imuLastEventsPerDrain),
+      static_cast<unsigned long>(snapshot.imuMaxEventsPerDrain),
+      static_cast<unsigned long>(snapshot.imuDrainBudgetHits),
+      static_cast<unsigned long>(snapshot.imuEventLimitHits),
+      static_cast<unsigned long>(snapshot.imuTransactionFailures),
+      static_cast<unsigned long>(snapshot.imuRecoveryAttempts),
+      static_cast<unsigned long>(snapshot.imuRecoveryFailures),
+      static_cast<unsigned>(snapshot.imuLastFailureStage),
       static_cast<unsigned long>(snapshot.jointConfiguredHz),
       static_cast<unsigned>(snapshot.faultCode), faultName(snapshot.faultCode),
       robotStateName(snapshot.robotState), snapshot.servosEnabled ? "true" : "false",

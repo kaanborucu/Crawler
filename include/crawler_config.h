@@ -13,12 +13,6 @@
 #define CRAWLER_ENABLE_BLE 1
 #endif
 
-// Diagnostic builds may continue running after the 40 ms threshold while
-// still counting every miss. Production/default builds enforce Fault 9.
-#ifndef CRAWLER_ENFORCE_INFERENCE_DEADLINE
-#define CRAWLER_ENFORCE_INFERENCE_DEADLINE 1
-#endif
-
 namespace crawler {
 namespace config {
 
@@ -28,9 +22,8 @@ constexpr uint8_t observationSize = 85;
 constexpr uint8_t actionCount = 3;
 constexpr uint32_t rateHz = 50;
 constexpr uint32_t periodUs = 20000;
-// Temporary validation allowance for the current generated policy. The
-// configured policy period remains 20 ms (50 Hz); this threshold only decides
-// when the safety supervisor raises InferenceDeadlineMiss.
+// Policy results slower than this are skipped and counted; they never become
+// active servo commands.
 constexpr uint32_t deadlineUs = 40000;
 constexpr float positionClampRad = 1.5707963f;
 constexpr float velocityClampRadPerSecond = 20.0f;
@@ -50,12 +43,21 @@ static_assert(historyFrames * 3 + historyFrames * 3 + historyFrames * 3 +
 }
 
 namespace imu {
-constexpr uint8_t sdaPin = 8;
-constexpr uint8_t sclPin = 9;
-constexpr uint32_t i2cFrequencyHz = 400000;
-constexpr uint32_t sampleRateHz = 1000;
-constexpr uint32_t taskPeriodUs = 1000;
-constexpr uint8_t fifoPacketBytes = 12;
+constexpr uint8_t spiSckPin = 12;
+constexpr uint8_t spiMisoPin = 13;
+constexpr uint8_t spiMosiPin = 11;
+constexpr uint8_t chipSelectPin = 10;
+constexpr uint8_t interruptPin = 7;
+constexpr int8_t resetPin = 6;
+constexpr uint32_t spiClockHz = 3000000;
+constexpr uint32_t accelReportIntervalUs = 4000;
+constexpr uint32_t gyroReportIntervalUs = 2500;
+constexpr uint32_t accelRequestedHz = 250;
+constexpr uint32_t gyroRequestedHz = 400;
+constexpr uint32_t accelStaleLimitUs = 20000;
+constexpr uint32_t gyroStaleLimitUs = 10000;
+constexpr uint32_t startupTimeoutMs = 5000;
+constexpr uint32_t interruptFallbackMs = 5;
 
 // The current wiring is treated as the training IMU frame. Change these
 // values after confirming the physical sensor orientation against training.
@@ -72,11 +74,11 @@ constexpr uint32_t configuredRateHz = 500;
 namespace safety {
 constexpr uint32_t commandTimeoutMs = 300;
 constexpr uint32_t sensorTimeoutMs = 300;
-constexpr float armPositionToleranceRad = 0.2f;
 }
 
 namespace telemetry {
-constexpr uint32_t printEveryCycles = 5;
+// Control loop is 50 Hz; print telemetry at 5 Hz.
+constexpr uint32_t printEveryCycles = 10;
 }
 
 namespace ble {
@@ -89,34 +91,32 @@ constexpr uint8_t protocolVersion = 1;
 
 namespace servo {
 // These values are deliberately invalid until the physical robot is measured.
-static const ServoCalibration calibrations[kJointCount] = {
-    {-1, -1, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0, 0, 0.0f, 0.0f, false,
-     false},
-    {-1, -1, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0, 0, 0.0f, 0.0f, false,
-     false},
-    {-1, -1, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0, 0, 0.0f, 0.0f, false,
-     false},
-};
+extern ServoCalibration calibrations[kJointCount];
+constexpr uint16_t calibrationAngleStepDegrees = 10;
+constexpr uint16_t calibrationMaximumAngleDegrees = 160;
+constexpr uint8_t calibrationPointCount =
+    calibrationMaximumAngleDegrees / calibrationAngleStepDegrees + 1;
+constexpr uint16_t calibrationAdcSampleCount = 31;
+constexpr uint16_t calibrationAdcTrimCount = 5;
+// The first point moves a high-torque servo from neutral to 0 degrees.
+// Allow enough time for that move to finish before sampling feedback.
+constexpr uint32_t calibrationSettleMs = 300;
+constexpr uint32_t calibrationFirstPointSettleMs = 1000;
+constexpr uint32_t calibrationInitialZeroWaitMs = 1000;
 
-inline bool calibrationValid() {
-  for (uint8_t i = 0; i < kJointCount; ++i) {
-    const ServoCalibration& c = calibrations[i];
-    if (!c.valid || c.pwmPin < 0 || c.feedbackAdcPin < 0 ||
-        !std::isfinite(c.defaultPositionRad) ||
-        !std::isfinite(c.jointZeroServoDegrees) ||
-        !std::isfinite(c.directionSign) || c.directionSign == 0.0f ||
-        !std::isfinite(c.jointMinimumRad) ||
-        !std::isfinite(c.jointMaximumRad) ||
-        c.jointMinimumRad > c.jointMaximumRad || c.minimumPulseUs <= 0 ||
-        c.maximumPulseUs <= c.minimumPulseUs ||
-        !std::isfinite(c.feedbackMillivoltsAtMinimum) ||
-        !std::isfinite(c.feedbackMillivoltsAtMaximum) ||
-        c.feedbackMillivoltsAtMinimum >= c.feedbackMillivoltsAtMaximum) {
-      return false;
-    }
-  }
-  return true;
-}
+extern uint16_t rawAdcAtAngle[kJointCount][calibrationPointCount];
+extern bool rawTableValid[kJointCount];
+
+bool hardwareConfigured();
+bool calibrationValid();
+bool rawTableIsValid(uint8_t joint);
+bool loadPersistentCalibration();
+bool savePersistentCalibration(
+    const ServoCalibration* candidateCalibrations,
+    const uint16_t candidateRawAdc[kJointCount][calibrationPointCount]);
+void applyCalibration(
+    const ServoCalibration* candidateCalibrations,
+    const uint16_t candidateRawAdc[kJointCount][calibrationPointCount]);
 }  // namespace servo
 
 }  // namespace config

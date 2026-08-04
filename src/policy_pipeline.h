@@ -15,6 +15,9 @@ class PolicyPipeline {
             const crawler::ImuState& imuState,
             const crawler::VelocityCommand& command,
             crawler::PolicyResult& result);
+  // Commit an accepted policy result to the next observation history. The
+  // caller may discard an over-deadline result before committing it.
+  void commitAction(const crawler::PolicyResult& result);
   void reset();
 
   const float* latestObservation() const;

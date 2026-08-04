@@ -106,8 +106,10 @@ Crawler::Crawler()
       cycleCount_(0),
       missedDeadlines_(0),
       maximumInferenceUs_(0),
+      calibrationRequestConsumed_(false),
       latestJoints_{},
       latestImu_{},
+      latestImuDiagnostics_{},
       latestCommand_{},
       latestResult_{}
 #if defined(ARDUINO)
@@ -118,19 +120,22 @@ Crawler::Crawler()
 uint64_t Crawler::nowUs() const { return monotonicUs(); }
 
 bool Crawler::begin() {
-  // Wi-Fi is diagnostic-only and must remain available even if robot startup
-  // later stops at invalid calibration or another hardware fault.
-  wifiTelemetry_.begin();
   safety_.begin();
   initialized_ = false;
-  if (!ble_.begin() || !robotIo_.begin()) return false;
   if (!imu_.begin()) {
     safety_.raiseFault(crawler::FaultCode::SensorInvalid);
     return false;
   }
-  if (!robotIo_.usingMockHardware() && !robotIo_.calibrationValid()) {
-    safety_.raiseFault(crawler::FaultCode::InvalidCalibration);
-    return false;
+  // Keep the sensor's known-good standalone startup isolated from the
+  // diagnostic networking tasks. Wi-Fi starts only after IMU initialization.
+  wifiTelemetry_.begin();
+  if (!ble_.begin() || !robotIo_.begin()) return false;
+  const bool calibrationReady =
+      robotIo_.usingMockHardware() || robotIo_.calibrationValid();
+  if (!robotIo_.usingMockHardware() && !calibrationReady) {
+    // An uncalibrated hardware build must still boot so the operator can
+    // enter calibration from the latched E-stop.
+    safety_.raiseFault(crawler::FaultCode::EmergencyStopRequested);
   }
   if (!policy_.begin()) {
     safety_.raiseFault(crawler::FaultCode::PolicyLoadFailure);
@@ -140,16 +145,19 @@ bool Crawler::begin() {
   latestCommand_ = ble_.latestCommand();
   latestJoints_ = robotIo_.readJointState();
   latestImu_ = imu_.read();
+  latestImuDiagnostics_ = imu_.diagnostics();
   if (!latestCommand_.valid) {
 #if CRAWLER_USE_MOCK_HARDWARE
     latestCommand_.valid = true;
-#else
-    return false;
 #endif
   }
-  if (!policy_.initialize(latestJoints_, latestImu_, latestCommand_)) {
-    safety_.raiseFault(crawler::FaultCode::SensorInvalid);
-    return false;
+  policyNeedsInitialization_ = true;
+  if (latestJoints_.valid && latestImu_.valid && latestCommand_.valid) {
+    if (!policy_.initialize(latestJoints_, latestImu_, latestCommand_)) {
+      safety_.raiseFault(crawler::FaultCode::SensorInvalid);
+    } else {
+      policyNeedsInitialization_ = false;
+    }
   }
   robotIo_.setMotionGate(false);
   robotIo_.setFastSafetyGate(false);
@@ -161,18 +169,16 @@ bool Crawler::begin() {
     return false;
   }
 #endif
-  policyNeedsInitialization_ = false;
   nextCycleUs_ = nowUs();
   initialized_ = true;
 #if defined(ARDUINO)
-  Serial0.printf("Crawler ready: mock=%u calibration=%u BLE=%u\n",
+  Serial0.printf("Crawler ready: mock=%u calibration=%u BLE=%u state=%u\n",
                  robotIo_.usingMockHardware() ? 1u : 0u,
                  robotIo_.calibrationValid() ? 1u : 0u,
-                 ble_.connected() ? 1u : 0u);
-  Serial0.printf("Inference deadline: %lu us, enforcement=%u\n",
-                 static_cast<unsigned long>(
-                     crawler::config::policy::deadlineUs),
-                 CRAWLER_ENFORCE_INFERENCE_DEADLINE ? 1u : 0u);
+                 ble_.connected() ? 1u : 0u,
+                 static_cast<unsigned>(safety_.state()));
+  Serial0.printf("Inference deadline: %lu us, late results are skipped\n",
+                 static_cast<unsigned long>(crawler::config::policy::deadlineUs));
 #endif
   return true;
 }
@@ -211,6 +217,45 @@ void Crawler::controlCycle() {
   const crawler::SafetyDecision decision =
       safety_.evaluate(latestCommand_, latestJoints_, latestImu_,
                        ble_.connected(), calibrationReady);
+
+  if (!latestCommand_.calibrationRequested) {
+    calibrationRequestConsumed_ = false;
+  }
+  if (robotIo_.calibrationActive() &&
+      (latestCommand_.emergencyStop || !ble_.connected())) {
+    robotIo_.abortCalibration();
+  }
+  if (safety_.state() == crawler::RobotState::EmergencyStopped &&
+      latestCommand_.calibrationRequested && !latestCommand_.emergencyStop &&
+      !calibrationRequestConsumed_ &&
+      !robotIo_.calibrationActive()) {
+    calibrationRequestConsumed_ = true;
+    if (!robotIo_.startCalibration(latestJoints_)) {
+#if defined(ARDUINO)
+      Serial0.println("Calibration request rejected: hardware is not configured");
+#endif
+    }
+  }
+  if (robotIo_.calibrationActive()) {
+    wifiTelemetry_.setPolicyControlActive(false);
+    robotIo_.setMotionGate(false);
+    robotIo_.setFastSafetyGate(false);
+    policyNeedsInitialization_ = true;
+    latestResult_ = {};
+    robotIo_.updateCalibration();
+#if defined(ARDUINO)
+    if (robotIo_.calibrationState() == ServoCalibrationState::Completed) {
+      Serial0.println("Servo calibration saved to NVS and activated");
+    }
+#endif
+    const crawler::RobotStatus status = {
+        safety_.state(), safety_.fault(), ble_.connected(),
+        latestCommand_.sequence, 0, missedDeadlines_};
+    ble_.publishStatus(status);
+    printTelemetry();
+    publishTelemetrySnapshot();
+    return;
+  }
 
   const bool emergencyHoldActive =
       latestCommand_.emergencyStop && ble_.connected() &&
@@ -256,10 +301,22 @@ void Crawler::controlCycle() {
     robotIo_.setMotionGate(true);
     float targetRad[crawler::kJointCount] = {};
     for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+      if (latestCommand_.centerPositionRequested) {
+        constexpr float degreesToRadians = 0.017453292519943295f;
+        const crawler::ServoCalibration& calibration =
+            crawler::config::servo::calibrations[i];
+        targetRad[i] =
+            (90.0f - calibration.jointZeroServoDegrees) * degreesToRadians /
+            calibration.directionSign;
+      } else {
+        targetRad[i] = std::fmax(
+            -crawler::config::policy::positionClampRad,
+            std::fmin(crawler::config::policy::positionClampRad,
+                      latestCommand_.rawPositionRad[i]));
+      }
       targetRad[i] = std::fmax(
           -crawler::config::policy::positionClampRad,
-          std::fmin(crawler::config::policy::positionClampRad,
-                    latestCommand_.rawPositionRad[i]));
+          std::fmin(crawler::config::policy::positionClampRad, targetRad[i]));
       latestResult_.rawActions[i] = targetRad[i];
       latestResult_.clampedActions[i] = targetRad[i];
       latestResult_.targetRad[i] = targetRad[i];
@@ -351,15 +408,25 @@ void Crawler::controlCycle() {
   }
   if (result.inferenceTimeUs > crawler::config::policy::deadlineUs) {
     ++missedDeadlines_;
-#if CRAWLER_ENFORCE_INFERENCE_DEADLINE
-    safety_.raiseFault(crawler::FaultCode::InferenceDeadlineMiss);
-    robotIo_.setMotionGate(false);
-    robotIo_.disableServos();
-#else
+    // Do not apply a late policy action. Hold the measured pose for this
+    // cycle, and leave the policy history unchanged so the late action is
+    // not fed into the next observation.
+    latestResult_ = {};
+    latestResult_.inferenceTimeUs = result.inferenceTimeUs;
+    for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
+      const float holdTarget =
+          latestJoints_.positionRad[i] -
+          crawler::config::servo::calibrations[i].defaultPositionRad;
+      latestResult_.targetRad[i] = holdTarget;
+      latestResult_.filteredTargetRad[i] = holdTarget;
+    }
+    latestResult_.valid = false;
+    wifiTelemetry_.setPolicyControlActive(false);
     robotIo_.setMotionGate(true);
-    robotIo_.writeTargets(result.filteredTargetRad);
-#endif
+    robotIo_.holdCurrentPosition(latestJoints_);
   } else {
+    policy_.commitAction(result);
+    latestResult_ = result;
     robotIo_.setMotionGate(true);
     robotIo_.writeTargets(result.filteredTargetRad);
   }
@@ -371,11 +438,6 @@ void Crawler::controlCycle() {
   printTelemetry();
   publishTelemetrySnapshot();
   completePolicyNetworkWindow();
-#if CRAWLER_ENFORCE_INFERENCE_DEADLINE
-  if (result.inferenceTimeUs > crawler::config::policy::deadlineUs) {
-    wifiTelemetry_.setPolicyControlActive(false);
-  }
-#endif
 }
 
 void Crawler::completePolicyNetworkWindow() {
@@ -394,6 +456,7 @@ void Crawler::refreshTelemetryInputs() {
   latestCommand_ = ble_.latestCommand();
   latestJoints_ = robotIo_.readJointState();
   latestImu_ = imu_.read();
+  latestImuDiagnostics_ = imu_.diagnostics();
 }
 
 void Crawler::publishTelemetrySnapshot() {
@@ -422,7 +485,40 @@ void Crawler::publishTelemetrySnapshot() {
   snapshot.maximumInferenceTimeUs = maximumInferenceUs_;
   snapshot.policyDeadlineMisses = missedDeadlines_;
   snapshot.policyRateHz = static_cast<float>(crawler::config::policy::rateHz);
-  snapshot.imuConfiguredHz = crawler::config::imu::sampleRateHz;
+  // Keep the legacy single-rate field for existing dashboard consumers. The
+  // separate fields below are the authoritative IMU configuration/metrics.
+  snapshot.imuConfiguredHz = crawler::config::imu::gyroRequestedHz;
+  snapshot.imuAccelRequestedHz = latestImuDiagnostics_.accelRequestedHz;
+  snapshot.imuAccelMeasuredHz = latestImuDiagnostics_.accelMeasuredHz;
+  snapshot.imuAccelAgeUs = latestImuDiagnostics_.accelAgeUs;
+  snapshot.imuAccelValid = latestImuDiagnostics_.accelValid;
+  snapshot.imuAccelAccuracy = latestImuDiagnostics_.accelAccuracy;
+  snapshot.imuAccelSequenceGaps = latestImuDiagnostics_.accelSequenceGaps;
+  snapshot.imuAccelTimestampBacksteps =
+      latestImuDiagnostics_.accelTimestampBacksteps;
+  snapshot.imuGyroRequestedHz = latestImuDiagnostics_.gyroRequestedHz;
+  snapshot.imuGyroMeasuredHz = latestImuDiagnostics_.gyroMeasuredHz;
+  snapshot.imuGyroAgeUs = latestImuDiagnostics_.gyroAgeUs;
+  snapshot.imuGyroValid = latestImuDiagnostics_.gyroValid;
+  snapshot.imuGyroAccuracy = latestImuDiagnostics_.gyroAccuracy;
+  snapshot.imuGyroSequenceGaps = latestImuDiagnostics_.gyroSequenceGaps;
+  snapshot.imuGyroTimestampBacksteps =
+      latestImuDiagnostics_.gyroTimestampBacksteps;
+  snapshot.imuResetRecoveryActive =
+      latestImuDiagnostics_.resetRecoveryActive;
+  snapshot.imuResetCount = latestImuDiagnostics_.resetCount;
+  snapshot.imuResetGeneration = latestImuDiagnostics_.resetGeneration;
+  snapshot.imuLastDrainUs = latestImuDiagnostics_.lastDrainUs;
+  snapshot.imuMaxDrainUs = latestImuDiagnostics_.maxDrainUs;
+  snapshot.imuLastEventsPerDrain = latestImuDiagnostics_.lastEventsPerDrain;
+  snapshot.imuMaxEventsPerDrain = latestImuDiagnostics_.maxEventsPerDrain;
+  snapshot.imuDrainBudgetHits = latestImuDiagnostics_.drainBudgetHits;
+  snapshot.imuEventLimitHits = latestImuDiagnostics_.eventLimitHits;
+  snapshot.imuTransactionFailures =
+      latestImuDiagnostics_.transactionFailures;
+  snapshot.imuRecoveryAttempts = latestImuDiagnostics_.recoveryAttempts;
+  snapshot.imuRecoveryFailures = latestImuDiagnostics_.recoveryFailures;
+  snapshot.imuLastFailureStage = latestImuDiagnostics_.lastFailureStage;
   snapshot.jointConfiguredHz = crawler::config::joints::configuredRateHz;
   snapshot.faultCode = safety_.fault();
   snapshot.robotState = safety_.state();
@@ -465,6 +561,9 @@ void Crawler::printTelemetry() {
       "TEL t=%lu state=%s fault=%u ble=%u cmd=%.3f,%.3f enable=%u "
       "joint=%.4f,%.4f,%.4f vel=%.4f,%.4f,%.4f raw=%.4f,%.4f,%.4f "
       "filtered=%.4f,%.4f,%.4f infer_us=%lu max_infer_us=%lu missed=%lu "
+      "imu=%u accel_valid=%u accel_age_us=%lu gyro_valid=%u gyro_age_us=%lu "
+      "drain_us=%lu drain_max_us=%lu events=%lu budget_hits=%lu "
+      "event_limit_hits=%lu tx_fail=%lu recovery=%lu/%lu stage=%u "
       "heap_internal_free=%lu heap_internal_min=%lu psram_free=%lu "
       "psram_min=%lu json_us=%lu json_max_us=%lu ws_us=%lu "
       "ws_max_us=%lu drops=%lu ws_failures=%lu ws_connected=%lu "
@@ -492,6 +591,20 @@ void Crawler::printTelemetry() {
       static_cast<unsigned long>(latestResult_.inferenceTimeUs),
       static_cast<unsigned long>(maximumInferenceUs_),
       static_cast<unsigned long>(missedDeadlines_),
+      latestImu_.valid ? 1u : 0u,
+      latestImuDiagnostics_.accelValid ? 1u : 0u,
+      static_cast<unsigned long>(latestImuDiagnostics_.accelAgeUs),
+      latestImuDiagnostics_.gyroValid ? 1u : 0u,
+      static_cast<unsigned long>(latestImuDiagnostics_.gyroAgeUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.lastDrainUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.maxDrainUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.lastEventsPerDrain),
+      static_cast<unsigned long>(latestImuDiagnostics_.drainBudgetHits),
+      static_cast<unsigned long>(latestImuDiagnostics_.eventLimitHits),
+      static_cast<unsigned long>(latestImuDiagnostics_.transactionFailures),
+      static_cast<unsigned long>(latestImuDiagnostics_.recoveryAttempts),
+      static_cast<unsigned long>(latestImuDiagnostics_.recoveryFailures),
+      static_cast<unsigned>(latestImuDiagnostics_.lastFailureStage),
       static_cast<unsigned long>(heap_caps_get_free_size(
           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
       static_cast<unsigned long>(heap_caps_get_minimum_free_size(
@@ -522,6 +635,9 @@ void Crawler::printTelemetry() {
       "TEL t=%lu state=%s fault=%u ble=%u cmd=%.3f,%.3f enable=%u "
       "joint=%.4f,%.4f,%.4f vel=%.4f,%.4f,%.4f raw=%.4f,%.4f,%.4f "
       "filtered=%.4f,%.4f,%.4f infer_us=%lu max_infer_us=%lu missed=%lu "
+      "imu=%u accel_valid=%u accel_age_us=%lu gyro_valid=%u gyro_age_us=%lu "
+      "drain_us=%lu drain_max_us=%lu events=%lu budget_hits=%lu "
+      "event_limit_hits=%lu tx_fail=%lu recovery=%lu/%lu stage=%u "
       "heap=%lu net_us=%lu net_max_us=%lu json_us=%lu json_max_us=%lu "
       "ws_us=%lu ws_max_us=%lu win_overruns=%lu drops=%lu\n",
       static_cast<unsigned long>(monotonicMs()), stateName(safety_.state()),
@@ -544,6 +660,20 @@ void Crawler::printTelemetry() {
       static_cast<unsigned long>(latestResult_.inferenceTimeUs),
       static_cast<unsigned long>(maximumInferenceUs_),
       static_cast<unsigned long>(missedDeadlines_),
+      latestImu_.valid ? 1u : 0u,
+      latestImuDiagnostics_.accelValid ? 1u : 0u,
+      static_cast<unsigned long>(latestImuDiagnostics_.accelAgeUs),
+      latestImuDiagnostics_.gyroValid ? 1u : 0u,
+      static_cast<unsigned long>(latestImuDiagnostics_.gyroAgeUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.lastDrainUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.maxDrainUs),
+      static_cast<unsigned long>(latestImuDiagnostics_.lastEventsPerDrain),
+      static_cast<unsigned long>(latestImuDiagnostics_.drainBudgetHits),
+      static_cast<unsigned long>(latestImuDiagnostics_.eventLimitHits),
+      static_cast<unsigned long>(latestImuDiagnostics_.transactionFailures),
+      static_cast<unsigned long>(latestImuDiagnostics_.recoveryAttempts),
+      static_cast<unsigned long>(latestImuDiagnostics_.recoveryFailures),
+      static_cast<unsigned>(latestImuDiagnostics_.lastFailureStage),
       static_cast<unsigned long>(ESP.getFreeHeap()),
       static_cast<unsigned long>(wifiMetrics.networkServiceUs),
       static_cast<unsigned long>(wifiMetrics.networkServiceMaxUs),

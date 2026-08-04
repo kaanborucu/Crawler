@@ -1,10 +1,12 @@
 #include "imu_sensor.h"
 
 #include <cmath>
+#include <limits>
 
 #if defined(ARDUINO)
 #include <Arduino.h>
-#include <Wire.h>
+#include <SPI.h>
+#include <esp_timer.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #else
@@ -13,212 +15,595 @@
 
 namespace {
 
-constexpr float kStandardGravityMps2 = 9.80665f;
-constexpr float kDegreesToRadians = 0.017453292519943295f;
+constexpr uint32_t kImuDrainBudgetUs = 2000;
+constexpr uint16_t kMaximumEventsPerDrain = 16;
+constexpr uint32_t kInitializationDrainBudgetUs = 20000;
+constexpr uint16_t kMaximumInitializationEventsPerDrain = 128;
+constexpr uint32_t kFallbackReadTimeoutUs = 1000;
+constexpr uint32_t kInitializationReportTimeoutUs = 1000000;
+constexpr uint8_t kMaximumRecoveryAttempts = 3;
+constexpr uint32_t kRecoveryRetryDelayMs = 10;
 
-uint32_t monotonicMs() {
+enum class FailureStage : uint8_t {
+  None = 0,
+  Drain = 1,
+  ReportRecovery = 2,
+};
+
+uint64_t monotonicUs() {
 #if defined(ARDUINO)
-  return millis();
+  return static_cast<uint64_t>(esp_timer_get_time());
 #else
   const std::chrono::steady_clock::time_point now =
       std::chrono::steady_clock::now();
-  return static_cast<uint32_t>(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
           now.time_since_epoch())
           .count());
 #endif
 }
 
-#if defined(ARDUINO)
-bool writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(address);
-  Wire.write(reg);
-  Wire.write(value);
-  return Wire.endTransmission() == 0;
-}
-
-bool readRegisters(uint8_t address, uint8_t reg, uint8_t* data,
-                   size_t length) {
-  Wire.beginTransmission(address);
-  Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return false;
-  const size_t received = Wire.requestFrom(address, length, true);
-  if (received != length) return false;
-  for (size_t i = 0; i < length; ++i) data[i] = Wire.read();
-  return true;
-}
-
-bool readWhoAmI(uint8_t address) {
-  uint8_t id = 0;
-  return readRegisters(address, 0x75, &id, 1) && (id == 0x68 || id == 0x69);
-}
-
-int16_t decodeBigEndianInt16(const uint8_t* bytes) {
-  return static_cast<int16_t>((static_cast<uint16_t>(bytes[0]) << 8) |
-                              static_cast<uint16_t>(bytes[1]));
-}
-
-uint16_t readFifoCount(uint8_t address) {
-  uint8_t bytes[2] = {};
-  if (!readRegisters(address, 0x72, bytes, sizeof(bytes))) return 0;
-  return static_cast<uint16_t>((static_cast<uint16_t>(bytes[0]) << 8) |
-                               static_cast<uint16_t>(bytes[1]));
+#if CRAWLER_USE_MOCK_HARDWARE
+uint32_t monotonicMs() {
+  return static_cast<uint32_t>(monotonicUs() / 1000u);
 }
 #endif
 
+#if defined(ARDUINO) && !CRAWLER_USE_MOCK_HARDWARE
+uint32_t saturateAgeUs(uint64_t ageUs) {
+  return ageUs > std::numeric_limits<uint32_t>::max()
+             ? std::numeric_limits<uint32_t>::max()
+             : static_cast<uint32_t>(ageUs);
+}
+#endif
+
+bool finiteVector(const float values[3]) {
+  for (uint8_t axis = 0; axis < 3; ++axis) {
+    if (!std::isfinite(values[axis])) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
-ImuSensor::ImuSensor()
-    : address_(0), present_(false), latest_{}
 #if defined(ARDUINO)
-      , mutex_(portMUX_INITIALIZER_UNLOCKED), taskHandle_(nullptr)
+ImuSensor* ImuSensor::activeInstance_ = nullptr;
+#endif
+
+ImuSensor::ImuSensor()
+    : present_(false),
+      shared_{},
+      accelStats_{},
+      gyroStats_{},
+      taskDiagnostics_{},
+      resetCount_(0),
+      resetGeneration_(0)
+#if defined(ARDUINO)
+      , mutex_(portMUX_INITIALIZER_UNLOCKED),
+      taskHandle_(nullptr),
+      bno08x_(crawler::config::imu::resetPin),
+      sensorValue_{},
+      recoveryInProgress_(false),
+      recoveryAttemptsSinceFresh_(0),
+      recoveryPending_(false),
+      runtimeMode_(false)
 #endif
 {}
 
 bool ImuSensor::begin() {
 #if CRAWLER_USE_MOCK_HARDWARE
   present_ = true;
-  latest_ = {};
-  latest_.timestampMs = monotonicMs();
-  latest_.valid = true;
+  shared_ = {};
+  shared_.accelValid = true;
+  shared_.gyroValid = true;
+  shared_.accelHostTimestampUs = monotonicUs();
+  shared_.gyroHostTimestampUs = shared_.accelHostTimestampUs;
   return true;
 #elif defined(ARDUINO)
-  Wire.begin(crawler::config::imu::sdaPin, crawler::config::imu::sclPin,
-            crawler::config::imu::i2cFrequencyHz);
+  pinMode(crawler::config::imu::chipSelectPin, OUTPUT);
+  digitalWrite(crawler::config::imu::chipSelectPin, HIGH);
+  pinMode(crawler::config::imu::interruptPin, INPUT_PULLUP);
+  SPI.begin(crawler::config::imu::spiSckPin,
+            crawler::config::imu::spiMisoPin,
+            crawler::config::imu::spiMosiPin,
+            crawler::config::imu::chipSelectPin);
 
-  const uint8_t candidates[] = {0x68, 0x69};
-  for (const uint8_t candidate : candidates) {
-    if (readWhoAmI(candidate)) {
-      address_ = candidate;
-      break;
-    }
+  // Match the known-good standalone startup: allow the SPI peripheral and
+  // sensor power/reset state to settle before beginning the SHTP handshake.
+  delay(500);
+  Serial0.println("Starting GY-BNO08X over SPI...");
+  if (!bno08x_.begin_SPI(crawler::config::imu::chipSelectPin,
+                         crawler::config::imu::interruptPin, &SPI)) {
+    Serial0.println("BNO08x initialization FAILED");
+    return false;
   }
-  if (address_ == 0) return false;
 
-  // Keep the MPU's internal sample rate at 1 kHz. Its DLPF removes the high
-  // frequency noise; the FIFO task publishes the newest sample to the policy.
-  if (!writeRegister(address_, 0x6B, 0x00) ||  // PWR_MGMT_1
-      !writeRegister(address_, 0x19, 0x00) ||  // SMPLRT_DIV: 1 kHz
-      !writeRegister(address_, 0x1A, 0x04) ||  // CONFIG: DLPF ~20 Hz
-      !writeRegister(address_, 0x1B, 0x00) ||  // GYRO_CONFIG: +/-250 dps
-      !writeRegister(address_, 0x1C, 0x00) ||  // ACCEL_CONFIG: +/-2 g
-      !writeRegister(address_, 0x1D, 0x04) ||  // ACCEL_CONFIG2: DLPF ~21 Hz
-      !writeRegister(address_, 0x6A, 0x04) ||  // USER_CTRL: reset FIFO
-      !writeRegister(address_, 0x6A, 0x40) ||  // USER_CTRL: enable FIFO
-      !writeRegister(address_, 0x23, 0x78) ||  // FIFO_EN: accel + gyro
-      !writeRegister(address_, 0x38, 0x10)) {  // INT_ENABLE: FIFO overflow
-    address_ = 0;
+  Serial0.println("BNO08x initialized successfully");
+  Serial0.printf("BNO08x reports requested: accel=%lu Hz gyro=%lu Hz SPI=%lu Hz\n",
+                 static_cast<unsigned long>(crawler::config::imu::accelRequestedHz),
+                 static_cast<unsigned long>(crawler::config::imu::gyroRequestedHz),
+                 static_cast<unsigned long>(crawler::config::imu::spiClockHz));
+  Serial0.printf("Product ID entries=%u\n",
+                 static_cast<unsigned int>(bno08x_.prodIds.numEntries));
+  for (uint8_t index = 0; index < bno08x_.prodIds.numEntries; ++index) {
+    const sh2_ProductId_t& product = bno08x_.prodIds.entry[index];
+    Serial0.printf(
+        "Product[%u] part=%lu version=%u.%u.%u build=%lu resetCause=%u\n",
+        static_cast<unsigned int>(index),
+        static_cast<unsigned long>(product.swPartNumber),
+        static_cast<unsigned int>(product.swVersionMajor),
+        static_cast<unsigned int>(product.swVersionMinor),
+        static_cast<unsigned int>(product.swVersionPatch),
+        static_cast<unsigned long>(product.swBuildNumber),
+        static_cast<unsigned int>(product.resetCause));
+  }
+
+  runtimeMode_ = false;
+  bno08x_.setEventDriven(false, kInitializationReportTimeoutUs, true);
+  // Consume only the reset generated by sh2_open()/initial hardware reset.
+  // Enabling reports can generate a later reset notification which must be
+  // handled by the IMU task.
+  bno08x_.wasReset();
+  if (!configureReports()) {
+    Serial0.println("BNO08x report setup FAILED");
     return false;
   }
 
   present_ = true;
-  if (xTaskCreatePinnedToCore(taskEntry, "crawler_imu", 4096, this, 8,
+  if (xTaskCreatePinnedToCore(taskEntry, "crawler_imu", 6144, this, 9,
                               &taskHandle_, 0) != pdPASS) {
     present_ = false;
-    address_ = 0;
+    Serial0.println("BNO08x IMU task could not start");
     return false;
   }
-  delay(20);
-  return true;
+
+  activeInstance_ = this;
+  attachInterrupt(digitalPinToInterrupt(crawler::config::imu::interruptPin),
+                  interruptHandler, FALLING);
+  bno08x_.setEventDriven(true);
+  xTaskNotifyGive(taskHandle_);
+
+  const uint32_t startMs = millis();
+  while (millis() - startMs < crawler::config::imu::startupTimeoutMs) {
+    if (read().valid) {
+      runtimeMode_ = true;
+      return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  Serial0.println("BNO08x startup timeout: waiting for fresh accel and gyro");
+  return false;
 #else
   return false;
 #endif
 }
 
 crawler::ImuState ImuSensor::read() {
+  crawler::ImuState state = {};
 #if CRAWLER_USE_MOCK_HARDWARE
-  crawler::ImuState state = latest_;
-  state.timestampMs = monotonicMs();
-  return state;
-#elif defined(ARDUINO)
-  crawler::ImuState state = {};
-  portENTER_CRITICAL(&mutex_);
-  state = latest_;
-  portEXIT_CRITICAL(&mutex_);
-  return state;
-#else
-  return {};
-#endif
-}
-
-crawler::ImuState ImuSensor::readFifoSample() {
-  crawler::ImuState state = {};
-#if defined(ARDUINO)
-  if (!present_ || address_ == 0) return state;
-
-  uint8_t bytes[crawler::config::imu::fifoPacketBytes] = {};
-  if (!readRegisters(address_, 0x74, bytes, sizeof(bytes))) return state;
-
-  const int16_t accelRaw[3] = {decodeBigEndianInt16(&bytes[0]),
-                                decodeBigEndianInt16(&bytes[2]),
-                                decodeBigEndianInt16(&bytes[4])};
-  const int16_t gyroRaw[3] = {decodeBigEndianInt16(&bytes[6]),
-                              decodeBigEndianInt16(&bytes[8]),
-                              decodeBigEndianInt16(&bytes[10])};
-  constexpr float accelMps2PerCount = kStandardGravityMps2 / 16384.0f;
-  constexpr float gyroRadPerSecondPerCount =
-      (1.0f / 131.0f) * kDegreesToRadians;
-
-  for (uint8_t outputAxis = 0; outputAxis < 3; ++outputAxis) {
-    const int8_t accelAxis = crawler::config::imu::accelAxis[outputAxis];
-    const int8_t gyroAxis = crawler::config::imu::gyroAxis[outputAxis];
-    if (accelAxis < 0 || accelAxis > 2 || gyroAxis < 0 || gyroAxis > 2) {
-      return state;
-    }
-    state.linearAccelerationMps2[outputAxis] =
-        static_cast<float>(accelRaw[accelAxis]) * accelMps2PerCount *
-        crawler::config::imu::accelSign[outputAxis];
-    state.angularVelocityRadPerSecond[outputAxis] =
-        static_cast<float>(gyroRaw[gyroAxis]) *
-        gyroRadPerSecondPerCount * crawler::config::imu::gyroSign[outputAxis];
-  }
-
-  for (uint8_t axis = 0; axis < 3; ++axis) {
-    if (!std::isfinite(state.linearAccelerationMps2[axis]) ||
-        !std::isfinite(state.angularVelocityRadPerSecond[axis])) {
-      return {};
-    }
-  }
   state.timestampMs = monotonicMs();
   state.valid = true;
-#endif
   return state;
-}
-
-void ImuSensor::publish(const crawler::ImuState& state) {
-#if defined(ARDUINO)
-  if (!state.valid) return;
+#elif defined(ARDUINO)
+  SharedState snapshot = {};
   portENTER_CRITICAL(&mutex_);
-  latest_ = state;
+  snapshot = shared_;
   portEXIT_CRITICAL(&mutex_);
+
+  for (uint8_t axis = 0; axis < 3; ++axis) {
+    state.linearAccelerationMps2[axis] = snapshot.accelerationMps2[axis];
+    state.angularVelocityRadPerSecond[axis] =
+        snapshot.angularVelocityRadPerSecond[axis];
+  }
+
+  const uint64_t nowUs = monotonicUs();
+  const uint64_t accelAgeUs =
+      snapshot.accelValid && nowUs >= snapshot.accelHostTimestampUs
+          ? nowUs - snapshot.accelHostTimestampUs
+          : std::numeric_limits<uint64_t>::max();
+  const uint64_t gyroAgeUs =
+      snapshot.gyroValid && nowUs >= snapshot.gyroHostTimestampUs
+          ? nowUs - snapshot.gyroHostTimestampUs
+          : std::numeric_limits<uint64_t>::max();
+
+  const bool accelUsable =
+      snapshot.accelValid && accelAgeUs <= crawler::config::imu::accelStaleLimitUs;
+  const bool gyroUsable =
+      snapshot.gyroValid && gyroAgeUs <= crawler::config::imu::gyroStaleLimitUs;
+  state.valid = accelUsable && gyroUsable && !snapshot.resetRecoveryActive &&
+                finiteVector(state.linearAccelerationMps2) &&
+                finiteVector(state.angularVelocityRadPerSecond);
+
+  uint64_t timestampUs = 0;
+  if (snapshot.accelHostTimestampUs != 0 &&
+      snapshot.gyroHostTimestampUs != 0) {
+    timestampUs = snapshot.accelHostTimestampUs < snapshot.gyroHostTimestampUs
+                      ? snapshot.accelHostTimestampUs
+                      : snapshot.gyroHostTimestampUs;
+  }
+  state.timestampMs = static_cast<uint32_t>(timestampUs / 1000u);
 #else
   (void)state;
 #endif
+  return state;
+}
+
+ImuDiagnostics ImuSensor::diagnostics() {
+  ImuDiagnostics result = {};
+  result.accelRequestedHz =
+      static_cast<float>(crawler::config::imu::accelRequestedHz);
+  result.gyroRequestedHz =
+      static_cast<float>(crawler::config::imu::gyroRequestedHz);
+
+#if CRAWLER_USE_MOCK_HARDWARE
+  result.accelValid = true;
+  result.gyroValid = true;
+  return result;
+#elif defined(ARDUINO)
+  SharedState snapshot = {};
+  StreamStats accelStats = {};
+  StreamStats gyroStats = {};
+  TaskDiagnostics taskDiagnostics = {};
+  uint32_t resetCount = 0;
+  uint32_t resetGeneration = 0;
+  portENTER_CRITICAL(&mutex_);
+  snapshot = shared_;
+  accelStats = accelStats_;
+  gyroStats = gyroStats_;
+  taskDiagnostics = taskDiagnostics_;
+  resetCount = resetCount_;
+  resetGeneration = resetGeneration_;
+  portEXIT_CRITICAL(&mutex_);
+
+  const uint64_t nowUs = monotonicUs();
+  const uint64_t accelAgeUs =
+      snapshot.accelValid && nowUs >= snapshot.accelHostTimestampUs
+          ? nowUs - snapshot.accelHostTimestampUs
+          : std::numeric_limits<uint64_t>::max();
+  const uint64_t gyroAgeUs =
+      snapshot.gyroValid && nowUs >= snapshot.gyroHostTimestampUs
+          ? nowUs - snapshot.gyroHostTimestampUs
+          : std::numeric_limits<uint64_t>::max();
+
+  result.accelAgeUs = saturateAgeUs(accelAgeUs);
+  result.gyroAgeUs = saturateAgeUs(gyroAgeUs);
+  result.accelValid =
+      snapshot.accelValid &&
+      accelAgeUs <= crawler::config::imu::accelStaleLimitUs &&
+      !snapshot.resetRecoveryActive;
+  result.gyroValid =
+      snapshot.gyroValid &&
+      gyroAgeUs <= crawler::config::imu::gyroStaleLimitUs &&
+      !snapshot.resetRecoveryActive;
+  result.accelAccuracy = snapshot.accelAccuracy;
+  result.gyroAccuracy = snapshot.gyroAccuracy;
+  result.accelMeasuredHz = measuredRate(accelStats);
+  result.gyroMeasuredHz = measuredRate(gyroStats);
+  result.accelSequenceGaps = accelStats.sequenceGaps;
+  result.gyroSequenceGaps = gyroStats.sequenceGaps;
+  result.accelTimestampBacksteps = accelStats.timestampBacksteps;
+  result.gyroTimestampBacksteps = gyroStats.timestampBacksteps;
+  result.resetRecoveryActive = snapshot.resetRecoveryActive;
+  result.resetCount = resetCount;
+  result.resetGeneration = resetGeneration;
+  result.lastDrainUs = taskDiagnostics.lastDrainUs;
+  result.maxDrainUs = taskDiagnostics.maxDrainUs;
+  result.lastEventsPerDrain = taskDiagnostics.lastEventsPerDrain;
+  result.maxEventsPerDrain = taskDiagnostics.maxEventsPerDrain;
+  result.drainBudgetHits = taskDiagnostics.drainBudgetHits;
+  result.eventLimitHits = taskDiagnostics.eventLimitHits;
+  result.transactionFailures = taskDiagnostics.transactionFailures;
+  result.recoveryAttempts = taskDiagnostics.recoveryAttempts;
+  result.recoveryFailures = taskDiagnostics.recoveryFailures;
+  result.lastFailureStage = taskDiagnostics.lastFailureStage;
+#endif
+  return result;
 }
 
 #if defined(ARDUINO)
+bool ImuSensor::configureReports() {
+  const bool accelConfigured = bno08x_.enableReport(
+      SH2_ACCELEROMETER, crawler::config::imu::accelReportIntervalUs);
+  const bool gyroConfigured = bno08x_.enableReport(
+      SH2_GYROSCOPE_CALIBRATED, crawler::config::imu::gyroReportIntervalUs);
+  if (!accelConfigured || !gyroConfigured) {
+    portENTER_CRITICAL(&mutex_);
+    ++taskDiagnostics_.transactionFailures;
+    taskDiagnostics_.lastFailureStage =
+        static_cast<uint8_t>(FailureStage::ReportRecovery);
+    portEXIT_CRITICAL(&mutex_);
+    Serial0.printf("BNO08x report setup failed: accel=%s gyro=%s\n",
+                   accelConfigured ? "ok" : "failed",
+                   gyroConfigured ? "ok" : "failed");
+    return false;
+  }
+  return true;
+}
+
+void ImuSensor::recordReport(StreamStats& stats,
+                             const sh2_SensorValue_t& value,
+                             uint64_t hostTimestampUs) {
+  if (!stats.hasPrevious) {
+    stats.firstHostTimestampUs = hostTimestampUs;
+    stats.firstSensorTimestampUs = value.timestamp;
+    stats.lastSensorTimestampUs = value.timestamp;
+    stats.hasPrevious = true;
+  } else {
+    const uint8_t sequenceDelta =
+        static_cast<uint8_t>(value.sequence - stats.lastSequence);
+    if (sequenceDelta > 1) stats.sequenceGaps += sequenceDelta - 1;
+    stats.sequenceAdvances += sequenceDelta;
+    if (value.timestamp < stats.lastSensorTimestampUs) {
+      ++stats.timestampBacksteps;
+    } else {
+      stats.lastSensorTimestampUs = value.timestamp;
+    }
+  }
+  ++stats.received;
+  stats.lastSequence = value.sequence;
+  stats.lastHostTimestampUs = hostTimestampUs;
+}
+
+float ImuSensor::measuredRate(const StreamStats& stats) const {
+  const uint64_t sensorSpanUs =
+      stats.lastSensorTimestampUs - stats.firstSensorTimestampUs;
+  if (stats.sequenceAdvances != 0 && sensorSpanUs != 0) {
+    return static_cast<float>(stats.sequenceAdvances) * 1000000.0f /
+           static_cast<float>(sensorSpanUs);
+  }
+  const uint64_t hostSpanUs =
+      stats.lastHostTimestampUs - stats.firstHostTimestampUs;
+  if (stats.received < 2 || hostSpanUs == 0) return 0.0f;
+  return static_cast<float>(stats.received - 1) * 1000000.0f /
+         static_cast<float>(hostSpanUs);
+}
+
+void IRAM_ATTR ImuSensor::interruptHandler() {
+  ImuSensor* instance = activeInstance_;
+  if (instance == nullptr || instance->taskHandle_ == nullptr) return;
+
+  BaseType_t higherPriorityTaskWoken = pdFALSE;
+  vTaskNotifyGiveFromISR(instance->taskHandle_, &higherPriorityTaskWoken);
+  if (higherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
+}
+
 void ImuSensor::taskEntry(void* argument) {
   static_cast<ImuSensor*>(argument)->taskLoop();
 }
 
-void ImuSensor::taskLoop() {
-  TickType_t lastWake = xTaskGetTickCount();
-  const TickType_t period = pdMS_TO_TICKS(1);
-  for (;;) {
-    uint16_t fifoCount = readFifoCount(address_);
-    if (fifoCount > 1024u ||
-        (fifoCount % crawler::config::imu::fifoPacketBytes) != 0u) {
-      writeRegister(address_, 0x6A, 0x04);
-      writeRegister(address_, 0x6A, 0x40);
-      writeRegister(address_, 0x23, 0x78);
-    } else {
-      while (fifoCount >= crawler::config::imu::fifoPacketBytes) {
-        publish(readFifoSample());
-        fifoCount = static_cast<uint16_t>(
-            fifoCount - crawler::config::imu::fifoPacketBytes);
-      }
+void ImuSensor::markResetRecovery() {
+  portENTER_CRITICAL(&mutex_);
+  ++resetCount_;
+  ++resetGeneration_;
+  shared_.accelValid = false;
+  shared_.gyroValid = false;
+  shared_.resetRecoveryActive = true;
+  shared_.accelHostTimestampUs = 0;
+  shared_.gyroHostTimestampUs = 0;
+  accelStats_ = {};
+  gyroStats_ = {};
+  portEXIT_CRITICAL(&mutex_);
+}
+
+void ImuSensor::handleResetIfNeeded() {
+  if (recoveryInProgress_ || recoveryPending_) return;
+  if (!bno08x_.wasReset()) return;
+
+  if (recoveryAttemptsSinceFresh_ >= kMaximumRecoveryAttempts) {
+    portENTER_CRITICAL(&mutex_);
+    ++taskDiagnostics_.recoveryFailures;
+    taskDiagnostics_.lastFailureStage =
+        static_cast<uint8_t>(FailureStage::ReportRecovery);
+    portEXIT_CRITICAL(&mutex_);
+    return;
+  }
+
+  Serial0.println("BNO08x reset detected; scheduling initialization recovery");
+  ++recoveryAttemptsSinceFresh_;
+  portENTER_CRITICAL(&mutex_);
+  ++taskDiagnostics_.recoveryAttempts;
+  portEXIT_CRITICAL(&mutex_);
+  markResetRecovery();
+  runtimeMode_ = false;
+  recoveryPending_ = true;
+}
+
+void ImuSensor::runRecoveryIfNeeded() {
+  if (!recoveryPending_ || recoveryInProgress_) return;
+
+  recoveryPending_ = false;
+  recoveryInProgress_ = true;
+  vTaskDelay(pdMS_TO_TICKS(kRecoveryRetryDelayMs));
+
+  // Reinitialize outside the runtime drain activation. This reuses the
+  // standalone startup state machine: reset, startup packets, product IDs,
+  // callback registration, then report configuration.
+  const bool initialized = bno08x_.reinitialize();
+  bool configured = false;
+  if (initialized) {
+    // Consume the reset generated by the initialization sequence. A reset
+    // generated by report configuration remains visible for the next task
+    // iteration and is handled as a separate recovery attempt.
+    bno08x_.wasReset();
+    bno08x_.setEventDriven(false, kInitializationReportTimeoutUs, true);
+    configured = configureReports();
+  }
+  bno08x_.setEventDriven(true);
+
+  if (!initialized || !configured) {
+    portENTER_CRITICAL(&mutex_);
+    ++taskDiagnostics_.recoveryFailures;
+    taskDiagnostics_.lastFailureStage =
+        static_cast<uint8_t>(FailureStage::ReportRecovery);
+    portEXIT_CRITICAL(&mutex_);
+    Serial0.printf("BNO08x initialization recovery failed: init=%s reports=%s\n",
+                   initialized ? "ok" : "failed",
+                   configured ? "ok" : "failed");
+  } else {
+    Serial0.println(
+        "BNO08x initialization recovery complete; waiting for fresh samples");
+  }
+  recoveryInProgress_ = false;
+}
+
+void ImuSensor::processSensorEvent(const sh2_SensorValue_t& value) {
+  const uint64_t hostTimestampUs = monotonicUs();
+
+  if (value.sensorId == SH2_ACCELEROMETER) {
+    float raw[3] = {value.un.accelerometer.x, value.un.accelerometer.y,
+                    value.un.accelerometer.z};
+    float mapped[3] = {};
+    for (uint8_t outputAxis = 0; outputAxis < 3; ++outputAxis) {
+      const int8_t inputAxis = crawler::config::imu::accelAxis[outputAxis];
+      if (inputAxis < 0 || inputAxis > 2) return;
+      mapped[outputAxis] = raw[inputAxis] *
+                           crawler::config::imu::accelSign[outputAxis];
     }
-    vTaskDelayUntil(&lastWake, period == 0 ? 1 : period);
+    if (!finiteVector(mapped)) return;
+
+    bool recovered = false;
+    portENTER_CRITICAL(&mutex_);
+    recordReport(accelStats_, value, hostTimestampUs);
+    for (uint8_t axis = 0; axis < 3; ++axis) {
+      shared_.accelerationMps2[axis] = mapped[axis];
+    }
+    shared_.accelHostTimestampUs = hostTimestampUs;
+    shared_.accelSensorTimestampUs = value.timestamp;
+    shared_.accelAccuracy = value.status & 0x03;
+    shared_.accelValid = true;
+    if (shared_.gyroValid && shared_.resetRecoveryActive) {
+      shared_.resetRecoveryActive = false;
+      recovered = true;
+    }
+    portEXIT_CRITICAL(&mutex_);
+    if (recovered) {
+      recoveryAttemptsSinceFresh_ = 0;
+      runtimeMode_ = true;
+    }
+    return;
+  }
+
+  if (value.sensorId == SH2_GYROSCOPE_CALIBRATED) {
+    float raw[3] = {value.un.gyroscope.x, value.un.gyroscope.y,
+                    value.un.gyroscope.z};
+    float mapped[3] = {};
+    for (uint8_t outputAxis = 0; outputAxis < 3; ++outputAxis) {
+      const int8_t inputAxis = crawler::config::imu::gyroAxis[outputAxis];
+      if (inputAxis < 0 || inputAxis > 2) return;
+      mapped[outputAxis] = raw[inputAxis] *
+                           crawler::config::imu::gyroSign[outputAxis];
+    }
+    if (!finiteVector(mapped)) return;
+
+    bool recovered = false;
+    portENTER_CRITICAL(&mutex_);
+    recordReport(gyroStats_, value, hostTimestampUs);
+    for (uint8_t axis = 0; axis < 3; ++axis) {
+      shared_.angularVelocityRadPerSecond[axis] = mapped[axis];
+    }
+    shared_.gyroHostTimestampUs = hostTimestampUs;
+    shared_.gyroSensorTimestampUs = value.timestamp;
+    shared_.gyroAccuracy = value.status & 0x03;
+    shared_.gyroValid = true;
+    if (shared_.accelValid && shared_.resetRecoveryActive) {
+      shared_.resetRecoveryActive = false;
+      recovered = true;
+    }
+    portEXIT_CRITICAL(&mutex_);
+    if (recovered) {
+      recoveryAttemptsSinceFresh_ = 0;
+      runtimeMode_ = true;
+    }
+  }
+}
+
+uint16_t ImuSensor::drainEvents() {
+  uint16_t totalProcessed = 0;
+  const uint64_t startUs = monotonicUs();
+  const uint16_t eventLimit = runtimeMode_
+                                  ? kMaximumEventsPerDrain
+                                  : kMaximumInitializationEventsPerDrain;
+  const uint32_t timeBudgetUs = runtimeMode_ ? kImuDrainBudgetUs
+                                             : kInitializationDrainBudgetUs;
+  while (totalProcessed < eventLimit &&
+         monotonicUs() - startUs < timeBudgetUs) {
+    if (!bno08x_.getSensorEvent(&sensorValue_)) break;
+    processSensorEvent(sensorValue_);
+    ++totalProcessed;
+  }
+
+  const uint32_t elapsedUs = static_cast<uint32_t>(monotonicUs() - startUs);
+  const bool budgetHit = elapsedUs >= timeBudgetUs;
+  const bool eventLimitHit = totalProcessed >= eventLimit;
+  portENTER_CRITICAL(&mutex_);
+  taskDiagnostics_.lastDrainUs = elapsedUs;
+  if (elapsedUs > taskDiagnostics_.maxDrainUs) {
+    taskDiagnostics_.maxDrainUs = elapsedUs;
+  }
+  taskDiagnostics_.lastEventsPerDrain = totalProcessed;
+  if (totalProcessed > taskDiagnostics_.maxEventsPerDrain) {
+    taskDiagnostics_.maxEventsPerDrain = totalProcessed;
+  }
+  if (budgetHit) ++taskDiagnostics_.drainBudgetHits;
+  if (eventLimitHit) ++taskDiagnostics_.eventLimitHits;
+  if (budgetHit || eventLimitHit) {
+    taskDiagnostics_.lastFailureStage =
+        static_cast<uint8_t>(FailureStage::Drain);
+  }
+  portEXIT_CRITICAL(&mutex_);
+  return totalProcessed;
+}
+
+void ImuSensor::taskLoop() {
+  for (;;) {
+    if (recoveryPending_) {
+      // Keep recovery out of the runtime drain activation and give the
+      // scheduler a chance to run before entering the bounded init path.
+      vTaskDelay(pdMS_TO_TICKS(1));
+      runRecoveryIfNeeded();
+      continue;
+    }
+
+    const bool interruptNotified =
+        ulTaskNotifyTake(
+            pdTRUE, pdMS_TO_TICKS(crawler::config::imu::interruptFallbackMs)) !=
+        0;
+
+    uint16_t processed = 0;
+    if (interruptNotified) {
+      // Normal acquisition: GPIO7 woke us, so drain only the packets made
+      // available by that interrupt.
+      bno08x_.setEventDriven(true);
+      processed = drainEvents();
+      if (processed == 0) {
+        // H_INTN can lead packet availability by a short interval during
+        // startup or recovery. Retry once with a bounded wait.
+        bno08x_.setEventDriven(false, kFallbackReadTimeoutUs, false);
+        processed = drainEvents();
+      }
+    } else {
+      // Recovery only: cover a missed edge with one bounded SPI wait. This
+      // path never performs a hardware reset.
+      bno08x_.setEventDriven(false, kFallbackReadTimeoutUs, false);
+      processed = drainEvents();
+    }
+    bno08x_.setEventDriven(true);
+
+    handleResetIfNeeded();
+    if (recoveryPending_) {
+      vTaskDelay(pdMS_TO_TICKS(1));
+      runRecoveryIfNeeded();
+      continue;
+    }
+    const uint16_t eventLimit = runtimeMode_
+                                    ? kMaximumEventsPerDrain
+                                    : kMaximumInitializationEventsPerDrain;
+    if (processed >= eventLimit) {
+      // Defer another bounded pass instead of looping while INT remains low.
+      xTaskNotifyGive(taskHandle_);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 #endif

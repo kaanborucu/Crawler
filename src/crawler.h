@@ -47,8 +47,10 @@ class Crawler {
   uint32_t cycleCount_;
   uint32_t missedDeadlines_;
   uint32_t maximumInferenceUs_;
+  bool calibrationRequestConsumed_;
   crawler::JointState latestJoints_;
   crawler::ImuState latestImu_;
+  ImuDiagnostics latestImuDiagnostics_;
   crawler::VelocityCommand latestCommand_;
   crawler::PolicyResult latestResult_;
 #if defined(ARDUINO)

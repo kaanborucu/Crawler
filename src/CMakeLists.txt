@@ -3,6 +3,7 @@ set(crawler_sources
     "crawler.cpp"
     "policy_pipeline.cpp"
     "robot_io.cpp"
+    "servo_calibration.cpp"
     "imu_sensor.cpp"
     "ble_control.cpp"
     "safety.cpp"

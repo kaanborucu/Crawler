@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 
 #include "safety.h"
 
@@ -67,6 +68,32 @@ int runSafetyTests() {
   expect(!decision.allowMotion && safety.state() == crawler::RobotState::Disarmed,
          "disable command did not disarm", failures);
 
+  Safety movingSafety;
+  movingSafety.begin();
+  command = validCommand(20, timestamp, true);
+  decision = movingSafety.evaluate(command, joints, imu, true, true);
+  expect(decision.allowMotion, "moving safety test did not start running",
+         failures);
+  crawler::JointState movedJoints = joints;
+  movedJoints.positionRad[0] = 0.5f;
+  movedJoints.timestampMs = nowMs();
+  command.sequence = 21;
+  command.receivedAtMs = nowMs();
+  decision = movingSafety.evaluate(command, movedJoints, imu, true, true);
+  expect(decision.allowMotion &&
+             movingSafety.state() == crawler::RobotState::Running,
+         "running robot was disarmed after moving away from neutral", failures);
+
+  Safety centerSafety;
+  centerSafety.begin();
+  crawler::VelocityCommand centerCommand = validCommand(22, nowMs(), true);
+  centerCommand.mode = crawler::ControlMode::RawPosition;
+  centerCommand.centerPositionRequested = true;
+  decision = centerSafety.evaluate(centerCommand, movedJoints, imu, true, true);
+  expect(decision.allowMotion &&
+             centerSafety.state() == crawler::RobotState::Running,
+         "center-position recovery was blocked away from neutral", failures);
+
   Safety invalidCalibration;
   invalidCalibration.begin();
   command = validCommand(2, timestamp, true);
@@ -99,6 +126,21 @@ int runSafetyTests() {
   expect(sensorSafety.fault() == crawler::FaultCode::SensorInvalid &&
              !decision.allowMotion,
          "invalid sensor did not fault safely", failures);
+
+  Safety temporaryImu;
+  temporaryImu.begin();
+  crawler::ImuState invalidImu = imu;
+  invalidImu.valid = false;
+  decision = temporaryImu.evaluate(validCommand(12, timestamp, true), joints,
+                                   invalidImu, true, true);
+  expect(!decision.allowMotion &&
+             temporaryImu.fault() == crawler::FaultCode::None &&
+             temporaryImu.state() == crawler::RobotState::Disarmed,
+         "temporary invalid IMU did not disarm without latching", failures);
+  decision = temporaryImu.evaluate(validCommand(13, timestamp, true), joints,
+                                   imu, true, true);
+  expect(decision.allowMotion && temporaryImu.fault() == crawler::FaultCode::None,
+         "recovered IMU did not clear the temporary invalid timer", failures);
 
   Safety nonfiniteSafety;
   nonfiniteSafety.begin();
@@ -149,5 +191,27 @@ int runSafetyTests() {
   expect(stopSafety.state() == crawler::RobotState::EmergencyStopped &&
              !decision.allowMotion,
          "emergency stop did not latch", failures);
+
+  Safety persistentImu;
+  persistentImu.begin();
+  const uint32_t persistentTimestamp = nowMs();
+  const crawler::JointState persistentJoints =
+      validJoints(persistentTimestamp);
+  const crawler::ImuState persistentInvalidImu = [&]() {
+    crawler::ImuState value = validImu(persistentTimestamp);
+    value.valid = false;
+    return value;
+  }();
+  decision = persistentImu.evaluate(
+      validCommand(14, persistentTimestamp, true), persistentJoints,
+      persistentInvalidImu, true, true);
+  std::this_thread::sleep_for(std::chrono::milliseconds(310));
+  decision = persistentImu.evaluate(
+      validCommand(15, nowMs(), true), validJoints(nowMs()),
+      persistentInvalidImu, true, true);
+  expect(!decision.allowMotion &&
+             persistentImu.fault() == crawler::FaultCode::SensorInvalid,
+         "persistent invalid IMU did not fault after the existing timeout",
+         failures);
   return failures;
 }

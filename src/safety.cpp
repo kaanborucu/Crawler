@@ -4,6 +4,7 @@
 
 #if defined(ARDUINO)
 #include <Arduino.h>
+#include <esp_timer.h>
 #else
 #include <chrono>
 #endif
@@ -19,6 +20,17 @@ uint32_t monotonicMs() {
   return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                   now.time_since_epoch())
                                   .count());
+#endif
+}
+
+uint64_t monotonicUs() {
+#if defined(ARDUINO)
+  return static_cast<uint64_t>(esp_timer_get_time());
+#else
+  const std::chrono::steady_clock::time_point now =
+      std::chrono::steady_clock::now();
+  return static_cast<uint64_t>(std::chrono::duration_cast<
+      std::chrono::microseconds>(now.time_since_epoch()).count());
 #endif
 }
 
@@ -79,13 +91,15 @@ Safety::Safety()
       fault_(crawler::FaultCode::None),
       requireNextEnable_(false),
       clearedFaultSequence_(0),
-      requireNewSequence_(false) {}
+      requireNewSequence_(false),
+      imuInvalidSinceUs_(0) {}
 
 void Safety::begin() {
   state_ = crawler::RobotState::Disarmed;
   fault_ = crawler::FaultCode::None;
   requireNextEnable_ = false;
   requireNewSequence_ = false;
+  imuInvalidSinceUs_ = 0;
 }
 
 uint32_t Safety::nowMs() const { return monotonicMs(); }
@@ -100,24 +114,25 @@ void Safety::setFault(crawler::FaultCode fault) {
 
 void Safety::raiseFault(crawler::FaultCode fault) { setFault(fault); }
 
-bool Safety::jointsNearDefault(const crawler::JointState& joints) const {
-  if (!joints.valid) return false;
-  for (uint8_t i = 0; i < crawler::kJointCount; ++i) {
-    if (!std::isfinite(joints.positionRad[i]) ||
-        std::fabs(joints.positionRad[i] -
-                  crawler::config::servo::calibrations[i].defaultPositionRad) >
-            crawler::config::safety::armPositionToleranceRad) {
-      return false;
-    }
-  }
-  return true;
-}
-
 crawler::SafetyDecision Safety::evaluate(
     const crawler::VelocityCommand& command,
     const crawler::JointState& joints, const crawler::ImuState& imu,
     bool bleConnected, bool calibrationValid) {
   if (command.emergencyStop) setFault(crawler::FaultCode::EmergencyStopRequested);
+
+  const uint64_t nowUs = monotonicUs();
+  if (imu.valid) {
+    imuInvalidSinceUs_ = 0;
+  } else if (imuInvalidSinceUs_ == 0) {
+    imuInvalidSinceUs_ = nowUs;
+  }
+
+  const uint64_t imuFailureTimeoutUs =
+      static_cast<uint64_t>(crawler::config::safety::sensorTimeoutMs) * 1000u;
+  if (!imu.valid && !faultActive() &&
+      nowUs - imuInvalidSinceUs_ >= imuFailureTimeoutUs) {
+    setFault(crawler::FaultCode::SensorInvalid);
+  }
 
   const bool causeGone =
       !command.emergencyStop && calibrationValid && finiteJointData(joints) &&
@@ -146,7 +161,12 @@ crawler::SafetyDecision Safety::evaluate(
   } else if (!finiteJointData(joints)) {
     setFault(crawler::FaultCode::NonFiniteObservation);
   } else if (!imu.valid) {
-    setFault(crawler::FaultCode::SensorInvalid);
+    // The current IMU sample is unusable immediately, but a short freshness
+    // failure is handled as a disarmed cycle. A persistent failure is latched
+    // above after the existing sensor timeout.
+    state_ = crawler::RobotState::Disarmed;
+    fault_ = crawler::FaultCode::None;
+    return {false, state_, fault_};
   } else if (!finiteImuData(imu)) {
     setFault(crawler::FaultCode::NonFiniteObservation);
   } else if (!jointsWithinConfiguredLimits(joints)) {
@@ -171,8 +191,6 @@ crawler::SafetyDecision Safety::evaluate(
   } else if (requireNewSequence_ && command.sequence == clearedFaultSequence_) {
     state_ = crawler::RobotState::Disarmed;
   } else if (requireNextEnable_ && !command.enableRequested) {
-    state_ = crawler::RobotState::Disarmed;
-  } else if (!jointsNearDefault(joints)) {
     state_ = crawler::RobotState::Disarmed;
   } else {
     state_ = crawler::RobotState::Running;

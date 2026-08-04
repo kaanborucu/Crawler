@@ -21,7 +21,6 @@ class Safety {
 
  private:
   uint32_t nowMs() const;
-  bool jointsNearDefault(const crawler::JointState& joints) const;
   void setFault(crawler::FaultCode fault);
 
   crawler::RobotState state_;
@@ -29,4 +28,5 @@ class Safety {
   bool requireNextEnable_;
   uint16_t clearedFaultSequence_;
   bool requireNewSequence_;
+  uint64_t imuInvalidSinceUs_;
 };

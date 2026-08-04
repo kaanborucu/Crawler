@@ -52,6 +52,8 @@ constexpr uint8_t emergencyStop = 0x02;
 constexpr uint8_t clearFault = 0x04;
 constexpr uint8_t rawPositionMode = 0x08;
 constexpr uint8_t scriptedSweepMode = 0x10;
+constexpr uint8_t calibration = 0x20;
+constexpr uint8_t centerPosition = 0x40;
 constexpr uint8_t modeMask = rawPositionMode | scriptedSweepMode;
 }
 

@@ -9,6 +9,13 @@
 #include "freertos/task.h"
 #endif
 
+enum class ServoCalibrationState : uint8_t {
+  Idle = 0,
+  Running = 1,
+  Completed = 2,
+  Failed = 3,
+};
+
 class RobotIO {
  public:
   RobotIO();
@@ -20,6 +27,12 @@ class RobotIO {
   void disableServos();
   void setMotionGate(bool allowed);
   void setFastSafetyGate(bool allowed);
+
+  bool startCalibration(const crawler::JointState& currentJoints);
+  void updateCalibration();
+  void abortCalibration();
+  bool calibrationActive() const;
+  ServoCalibrationState calibrationState() const;
 
   bool calibrationValid() const;
   bool usingMockHardware() const;
@@ -34,10 +47,22 @@ class RobotIO {
       float targetRad, const crawler::ServoCalibration& calibration);
 
  private:
+  enum class CalibrationPhase : uint8_t {
+    InitialZeroWait = 0,
+    Sampling = 1,
+    NeutralWait = 2,
+  };
+
   uint32_t nowMs() const;
   crawler::JointState sampleJointState();
   void updateEstimatedVelocity(const float position[3], uint32_t timestampMs,
                                float velocity[3]);
+  bool writeAllCalibrationPose(float servoDegrees);
+  bool writeCalibrationPose(uint8_t activeJoint, float servoDegrees);
+  bool writeNeutralCalibrationPose();
+  bool readFilteredRawAdc(uint8_t joint, uint16_t& rawAdc) const;
+  bool finishCalibration();
+  bool validateCalibrationSamples() const;
 #if defined(ARDUINO)
   static void taskEntry(void* argument);
   void taskLoop();
@@ -53,6 +78,12 @@ class RobotIO {
   crawler::JointState latestHardwareState_;
   volatile bool motionGate_;
   volatile bool fastSafetyGate_;
+  ServoCalibrationState calibrationState_;
+  CalibrationPhase calibrationPhase_;
+  uint8_t calibrationJoint_;
+  uint8_t calibrationPoint_;
+  uint32_t calibrationSettleUntilMs_;
+  uint16_t calibrationSamples_[3][crawler::config::servo::calibrationPointCount];
 #if defined(ARDUINO)
   portMUX_TYPE mutex_;
   TaskHandle_t taskHandle_;
